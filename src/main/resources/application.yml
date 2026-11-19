@@ -1,0 +1,50 @@
+server:
+  port: 8787
+
+spring:
+  thymeleaf:
+    cache: false
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          # Spring Boot serves static files with only a Last-Modified header and no
+          # Cache-Control, so Chrome falls back to heuristic caching and reuses dashboard.js /
+          # dashboard.css without revalidating. Observed in practice: the template rendered the
+          # new quick-action bars (Thymeleaf caching is already off) while the browser ran an
+          # older script that knew nothing about them, so the bars appeared empty and unstyled.
+          # This tool is iterated on constantly and serves one local user, so never store.
+          no-store: true
+
+flow-capture:
+  # Local clone of Jar_Frontend_Automation that generated files get written into.
+  # Override with --flow-capture.target-repo-path=/abs/path when launching.
+  target-repo-path: /Users/apple/Desktop/RegressionRun/TransactionsRevamp/Jar_Frontend_Automation
+
+  appium:
+    server-url: http://127.0.0.1:4723
+    platform-name: Android
+    automation-name: UiAutomator2
+    # Leave blank to auto-pick the first connected device via `adb devices`.
+    device-name: ""
+    # Matches androidPackage in Jar_Frontend_Automation's config.properties.
+    android-package: com.aso_centric.jar.staging
+
+  screen-stream:
+    # Fallback mirror only. Measured on a real device: an Appium screenshot round-trip takes
+    # seconds and holds the driver lock the whole time, giving ~0.26 fps AND starving element
+    # lookups — a replay step could time out while the element was on screen the whole time.
+    poll-interval-ms: 400
+    # The UiAutomator2 server broadcasts JPEG frames on this device port, outside the
+    # WebDriver command queue. Measured at ~10 fps with no effect on element lookups.
+    device-mjpeg-port: 7810
+    host-mjpeg-port: 7810
+    prefer-mjpeg: true
+    adb-path: adb
+
+  bifrost:
+    enabled: false
+    base-url: https://bifrost.myjar.app/anthropic
+    # Never commit a real key. Set via env var FLOW_CAPTURE_BIFROST_KEY at launch time.
+    api-key: ${FLOW_CAPTURE_BIFROST_KEY:}
+    model: claude-sonnet-5

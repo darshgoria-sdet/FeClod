@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Flow Capture Studio</title>
+    <link rel="stylesheet" href="/css/dashboard.css">
+</head>
+<body>
+<div class="layout">
+    <header>
+        <h1>Flow Capture Studio</h1>
+        <div class="device-controls">
+            <span id="connectionStatus" class="status">not connected</span>
+            <button id="connectBtn">Connect Device</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+    </header>
+
+    <div id="resumeBanner" class="resume-banner hidden">
+        <span id="resumeText"></span>
+        <button id="resumeBtn">Resume it</button>
+        <button id="discardResumeBtn">Discard</button>
+    </div>
+
+    <div id="errorBanner" class="error-banner hidden"></div>
+
+    <!-- Advisory, not a failure: the foreground app is not the configured package. Separate
+         from the error banner so it is not cleared by the next successful action. -->
+    <div id="warningBanner" class="warning-banner hidden">
+        <span id="warningText"></span>
+        <button id="dismissWarningBtn">Dismiss</button>
+    </div>
+
+    <div class="main">
+        <!-- The mirror is the thing QA actually aims at, so it gets the height of the window
+             and a width that scales with the viewport. Everything else here is deliberately
+             compact so nothing steals vertical space from it. -->
+        <div class="screen-pane">
+            <div id="screenWrapper" class="screen-wrapper">
+                <img id="screenImg" alt="device mirror" />
+                <div id="pickOverlay" class="pick-overlay hidden">
+                    <span id="pickOverlayText">Tap the element on the screen</span>
+                </div>
+            </div>
+            <p class="hint">Click to tap &middot; <kbd>Shift</kbd>+click to type into a field</p>
+            <div class="screen-actions">
+                <button id="scrollDownBtn" disabled title="Record that you scrolled down, and scroll the device">Scrolled &darr;</button>
+                <button id="scrollUpBtn" disabled title="Record that you scrolled up, and scroll the device">Scrolled &uarr;</button>
+                <button id="newScreenBtn" disabled title="Mark that a new screen was reached">New screen</button>
+                <button id="undoBtn" disabled title="Remove the last recorded step">Undo</button>
+            </div>
+        </div>
+
+        <div class="side-pane">
+            <section class="flow-control">
+                <div class="flow-row">
+                    <input id="flowNameInput" placeholder="Flow name, e.g. InstantSaveAbcButton" />
+                    <select id="targetAreaSelect"></select>
+                </div>
+                <div class="flow-row">
+                    <button id="startFlowBtn" class="primary">Start Recording</button>
+                    <button id="replayBtn" disabled title="Run every recorded step back against the device">Replay</button>
+                    <button id="finishFlowBtn" disabled>Finish &amp; Generate</button>
+                </div>
+            </section>
+
+            <div class="tabs">
+                <button class="pane-tab active" data-pane="stepsPane">Steps <span id="stepCount" class="count">0</span></button>
+                <button class="pane-tab" data-pane="actionsPane">Existing methods <span id="actionCount" class="count">0</span></button>
+            </div>
+
+            <section id="stepsPane" class="pane">
+                <ol id="stepsList"></ol>
+                <p id="stepsEmpty" class="empty-note">No steps yet. Start recording, then tap the screen.</p>
+
+                <section id="suggestionBox" class="suggestion-box hidden">
+                    <p id="suggestionText"></p>
+                    <div class="modal-buttons">
+                        <button id="acceptSuggestionBtn" class="primary">Use existing method</button>
+                        <button id="declineSuggestionBtn">Write new logic</button>
+                    </div>
+                </section>
+
+                <!-- Replay output lives above the generated-code result, because it is what
+                     decides whether generating is a good idea in the first place. -->
+                <section id="replayBox" class="replay-box hidden">
+                    <div class="replay-head">
+                        <h2>Replay</h2>
+                        <button id="replayCloseBtn" class="link-btn">Close</button>
+                    </div>
+                    <p id="replaySummary" class="replay-summary"></p>
+                    <ol id="replayResults" class="replay-results"></ol>
+                </section>
+
+                <section id="resultBox" class="result-box hidden">
+                    <h2>Result</h2>
+                    <pre id="resultText"></pre>
+                </section>
+            </section>
+
+            <!-- Grouped and searchable: 24 flat pills were impossible to scan, and the name
+                 alone does not say what a method does, so each row carries its description. -->
+            <section id="actionsPane" class="pane hidden">
+                <input id="actionSearch" class="action-search" placeholder="Search methods, e.g. scroll, back, wait" />
+                <div id="actionGroups" class="action-groups"></div>
+                <p id="actionsEmpty" class="empty-note hidden">No method matches that search.</p>
+                <p class="hint pane-foot">
+                    Runs the real method from <code>ActionUtils</code> / <code>WaitUtils</code> / <code>WebUtils</code>
+                    on your device and records the call, so the generated page object reuses it.
+                    <span id="locatorIndexStatus" class="index-status"></span>
+                </p>
+            </section>
+        </div>
+
+        <div class="preview-pane">
+            <div class="preview-tabs">
+                <button class="preview-tab active" data-file="locators">Locators</button>
+                <button class="preview-tab" data-file="page">Page</button>
+                <button class="preview-tab" data-file="test">Test</button>
+            </div>
+            <pre id="previewCode" class="preview-code">// Start recording to see generated code here.</pre>
+        </div>
+    </div>
+</div>
+
+<!-- Collects the arguments a catalogued method needs before it runs on the device.
+     Fields are generated from the method's MethodParam list, so a new argument shape
+     needs no change here. -->
+<div id="paramModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p id="paramModalTitle" class="modal-title">Arguments</p>
+        <p id="paramModalDesc" class="modal-desc"></p>
+        <div id="paramFields"></div>
+        <div class="modal-buttons">
+            <button id="paramConfirmBtn" class="primary">Run &amp; record</button>
+            <button id="paramCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Replay needs one decision before it runs: start from where the phone is, or from a
+     fresh app launch the way a real test run would. -->
+<div id="replayModal" class="modal hidden">
+    <div class="modal-content">
+        <p class="modal-title">Replay this flow</p>
+        <p class="modal-desc">
+            Every recorded step runs again on the device, in order, stopping at the first failure.
+            Manual steps are skipped — do those by hand when the replay reaches them.
+        </p>
+        <div class="modal-buttons">
+            <button id="replayRestartBtn" class="primary">Restart app, then replay</button>
+            <button id="replayHereBtn">Replay from current screen</button>
+            <button id="replayCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Shown when a captured element's locator is already declared elsewhere in the repo. -->
+<div id="reuseModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p class="modal-title">This locator already exists</p>
+        <p id="reuseDetail" class="modal-desc"></p>
+        <div class="modal-buttons">
+            <button id="reuseAcceptBtn" class="primary">Use existing</button>
+            <button id="reuseDeclineBtn">Create new</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal for naming a tapped element -->
+<div id="labelModal" class="modal hidden">
+    <div class="modal-content">
+        <p id="modalPrompt" class="modal-title">Describe this action</p>
+        <input id="labelInput" placeholder="e.g. tap abc button" />
+        <input id="inputValueField" class="hidden" placeholder="text to type" />
+        <div class="modal-buttons">
+            <button id="labelConfirmBtn" class="primary">Confirm</button>
+            <button id="labelCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<script src="/js/dashboard.js"></script>
+</body>
+</html>
