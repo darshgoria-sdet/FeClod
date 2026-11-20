@@ -3,6 +3,7 @@ package com.jar.flowcapture.codegen;
 import com.jar.flowcapture.capture.ExistingLocatorRef;
 import com.jar.flowcapture.capture.RecordedFlow;
 import com.jar.flowcapture.capture.RecordedStep;
+import com.jar.flowcapture.capture.TryBlock;
 import com.jar.flowcapture.capture.UtilityArgs;
 import com.jar.flowcapture.catalog.MethodCatalogService;
 import com.jar.flowcapture.catalog.MethodParam;
@@ -59,67 +60,31 @@ public class PageClassGenerator {
         StringBuilder body = new StringBuilder();
         List<RecordedStep> steps = flow.getSteps();
 
+        // Try/catch is emitted by watching the step list for a change of block, rather than
+        // from a pair of indexes on the block: steps move, and a try that slid onto the wrong
+        // ones would be a silent change of meaning. A block split by a later insertion simply
+        // renders as two try/catch blocks with the same handling, which is still correct.
+        String openGroup = null;
         for (int i = 0; i < steps.size(); i++) {
             RecordedStep step = steps.get(i);
-            switch (step.getActionType()) {
-                case SCREEN_BOUNDARY -> body.append("        // --- screen: ")
-                        .append(commentSafe(step.getScreenName() == null ? "(unnamed)" : step.getScreenName()))
-                        .append(" ---\n");
+            // A catch step is not part of the main sequence; it is emitted inside the catch of
+            // the block it belongs to, wherever that block's try sits.
+            if (step.getCatchGroup() != null) continue;
+            StringBuilder stepOut = new StringBuilder();
+            renderStep(step, steps, i, stepOut, locatorFieldName, extraImports,
+                    reusedLocatorClasses, instanceFields);
 
-                case TAP -> body.append("        waitForClick(")
-                        .append(elementRef(step, locatorFieldName, extraImports, reusedLocatorClasses))
-                        .append(").click();\n");
-
-                case INPUT -> body.append("        waitForClick(")
-                        .append(elementRef(step, locatorFieldName, extraImports, reusedLocatorClasses))
-                        .append(").sendKeys(\"")
-                        .append(JavaLiteralEscaper.escape(step.getInputValue())).append("\");\n");
-
-                case SCROLL_DOWN, SCROLL_UP -> {
-                    ReusableMethod reused = matchedMethod(step);
-                    // scrollUntilElementFound(WebElement)/scrollUpUntilElementFound(WebElement) need a target —
-                    // that target is whatever the QA engineer tapped right after scrolling to reveal it, i.e.
-                    // the next TAP step in the recorded sequence. Falls back to a TODO only when the scroll
-                    // is the last step or isn't immediately followed by a tap (nothing to infer a target from).
-                    RecordedStep nextTap = nextTapStep(steps, i);
-                    if (reused != null && nextTap != null) {
-                        extraImports.add(reused.getImportStatement());
-                        body.append("        ").append(reused.getFullyQualifiedCall()).append("(")
-                                .append(elementRef(nextTap, locatorFieldName, extraImports, reusedLocatorClasses))
-                                .append(");\n");
-                    } else if (reused != null) {
-                        extraImports.add(reused.getImportStatement());
-                        body.append("        ").append(reused.getFullyQualifiedCall())
-                                .append("(/* TODO: no tap follows this scroll — set the target element */);\n");
-                    } else {
-                        body.append("        // TODO: ")
-                                .append(step.getActionType() == RecordedStep.ActionType.SCROLL_DOWN ? "scroll down" : "scroll up")
-                                .append(" — no existing helper matched, verify ActionUtils\n");
-                    }
-                }
-
-                case UTILITY_CALL -> {
-                    ReusableMethod method = utilityMethod(step);
-                    if (method == null) {
-                        body.append("        // TODO: unrecognized utility action \"")
-                                .append(commentSafe(step.getActionLabel())).append("\"\n");
-                        break;
-                    }
-                    extraImports.add(method.getImportStatement());
-                    if (method.isInstanceMethod()) {
-                        // Matches MonthlySavingsPage's own `PaymentHelper payment = new PaymentHelper();`
-                        // style — calling an instance method statically would not compile.
-                        instanceFields.put(method.getInstanceFieldName(), method.getInstanceClassName());
-                    }
-                    if (method.isNeedsDriverArg()) {
-                        extraImports.add("basePackage.DriverFactory");
-                    }
-                    body.append("        ").append(method.getFullyQualifiedCall()).append("(")
-                            .append(renderArgs(method, step, locatorFieldName, extraImports, reusedLocatorClasses))
-                            .append(");\n");
-                }
+            String group = step.getTryGroup();
+            if (!java.util.Objects.equals(group, openGroup)) {
+                if (openGroup != null) body.append(renderCatch(flow, openGroup, locatorFieldName,
+                extraImports, reusedLocatorClasses, instanceFields));
+                if (group != null) body.append("        try {\n");
+                openGroup = group;
             }
+            body.append(openGroup == null ? stepOut : indentOneLevel(stepOut));
         }
+        if (openGroup != null) body.append(renderCatch(flow, openGroup, locatorFieldName,
+                extraImports, reusedLocatorClasses, instanceFields));
 
         StringBuilder sb = new StringBuilder();
         sb.append("package ").append(pagePackage).append(";\n\n");
@@ -129,7 +94,13 @@ public class PageClassGenerator {
                     .append(ref.getLocatorsClassName()).append(";\n");
         }
         for (String imp : extraImports) sb.append("import ").append(imp).append(";\n");
+        boolean logsInACatch = flow.getTryBlocks().stream()
+                .anyMatch(b -> b.getOnFailure() == TryBlock.OnFailure.CONTINUE);
+        if (logsInACatch) sb.append("import lombok.extern.slf4j.Slf4j;\n");
         sb.append("\nimport static utilsPackage.WaitUtils.waitForClick;\n\n");
+        // Matches HandlingBottomSheets, which is this repo's own answer to the optional-screen
+        // problem: @Slf4j on the class, log.info in the catch.
+        if (logsInACatch) sb.append("@Slf4j\n");
         sb.append("public class ").append(pageClassName).append(" {\n");
         sb.append("    ").append(locatorsClassName).append(" ").append(locatorFieldName)
                 .append(" = new ").append(locatorsClassName).append("(null);\n");
@@ -147,6 +118,131 @@ public class PageClassGenerator {
         sb.append("}\n");
 
         return new Result(pageClassName, sb.toString());
+    }
+
+
+    /**
+     * One step's generated lines, at the method's own indent.
+     *
+     * Extracted so the catch of a RUN_RECOVERY_STEPS block can render its backup steps with
+     * exactly the same code as the main sequence — a second rendering path would drift, and
+     * the whole point of a recovery step is that it is an ordinary step.
+     *
+     * @param index this step's position for look-ahead, or -1 when rendering inside a catch,
+     *              where "the next tap" is not a meaningful question
+     */
+    private void renderStep(RecordedStep step, List<RecordedStep> steps, int index, StringBuilder stepOut,
+                            String locatorFieldName, Set<String> extraImports,
+                            Map<String, ExistingLocatorRef> reusedLocatorClasses,
+                            Map<String, String> instanceFields) {
+            switch (step.getActionType()) {
+                case SCREEN_BOUNDARY -> stepOut.append("        // --- screen: ")
+                        .append(commentSafe(step.getScreenName() == null ? "(unnamed)" : step.getScreenName()))
+                        .append(" ---\n");
+
+                case TAP -> stepOut.append("        waitForClick(")
+                        .append(elementRef(step, locatorFieldName, extraImports, reusedLocatorClasses))
+                        .append(").click();\n");
+
+                case INPUT -> stepOut.append("        waitForClick(")
+                        .append(elementRef(step, locatorFieldName, extraImports, reusedLocatorClasses))
+                        .append(").sendKeys(\"")
+                        .append(JavaLiteralEscaper.escape(step.getInputValue())).append("\");\n");
+
+                case SCROLL_DOWN, SCROLL_UP -> {
+                    ReusableMethod reused = matchedMethod(step);
+                    // scrollUntilElementFound(WebElement)/scrollUpUntilElementFound(WebElement) need a target —
+                    // that target is whatever the QA engineer tapped right after scrolling to reveal it, i.e.
+                    // the next TAP step in the recorded sequence. Falls back to a TODO only when the scroll
+                    // is the last step or isn't immediately followed by a tap (nothing to infer a target from).
+                    // -1 means "inside a catch", where there is no following step to read a
+                    // scroll target from; the TODO branch below says so in the generated code.
+                    RecordedStep nextTap = index < 0 ? null : nextTapStep(steps, index);
+                    if (reused != null && nextTap != null) {
+                        extraImports.add(reused.getImportStatement());
+                        stepOut.append("        ").append(reused.getFullyQualifiedCall()).append("(")
+                                .append(elementRef(nextTap, locatorFieldName, extraImports, reusedLocatorClasses))
+                                .append(");\n");
+                    } else if (reused != null) {
+                        extraImports.add(reused.getImportStatement());
+                        stepOut.append("        ").append(reused.getFullyQualifiedCall())
+                                .append("(/* TODO: no tap follows this scroll — set the target element */);\n");
+                    } else {
+                        stepOut.append("        // TODO: ")
+                                .append(step.getActionType() == RecordedStep.ActionType.SCROLL_DOWN ? "scroll down" : "scroll up")
+                                .append(" — no existing helper matched, verify ActionUtils\n");
+                    }
+                }
+
+                case UTILITY_CALL -> {
+                    ReusableMethod method = utilityMethod(step);
+                    if (method == null) {
+                        stepOut.append("        // TODO: unrecognized utility action \"")
+                                .append(commentSafe(step.getActionLabel())).append("\"\n");
+                        break;
+                    }
+                    extraImports.add(method.getImportStatement());
+                    if (method.isInstanceMethod()) {
+                        // Matches MonthlySavingsPage's own `PaymentHelper payment = new PaymentHelper();`
+                        // style — calling an instance method statically would not compile.
+                        instanceFields.put(method.getInstanceFieldName(), method.getInstanceClassName());
+                    }
+                    if (method.isNeedsDriverArg()) {
+                        extraImports.add("basePackage.DriverFactory");
+                    }
+                    stepOut.append("        ").append(method.getFullyQualifiedCall()).append("(")
+                            .append(renderArgs(method, step, locatorFieldName, extraImports, reusedLocatorClasses))
+                            .append(");\n");
+                }
+            }
+    }
+
+    /**
+     * The closing half of a try block, in the shape the repo already writes by hand.
+     *
+     * CONTINUE logs and carries on, which is what makes an optional screen optional.
+     * FAIL_WITH_MESSAGE still fails, but with the flow author's sentence instead of
+     * "no such element", which is the difference between a reviewer understanding a CI
+     * failure and having to reproduce it.
+     */
+    private String renderCatch(RecordedFlow flow, String groupId, String locatorFieldName,
+                               Set<String> extraImports, Map<String, ExistingLocatorRef> reusedClasses,
+                               Map<String, String> instanceFields) {
+        TryBlock block = flow.tryBlock(groupId).orElse(null);
+        String note = (block == null || block.getNote() == null || block.getNote().isBlank())
+                ? "optional steps did not run"
+                : commentSafe(block.getNote());
+        StringBuilder out = new StringBuilder("        } catch (Exception e) {\n");
+
+        if (block != null && block.getOnFailure() == TryBlock.OnFailure.FAIL_WITH_MESSAGE) {
+            out.append("            throw new AssertionError(\"")
+                    .append(JavaLiteralEscaper.escape(note)).append("\", e);\n");
+            return out.append("        }\n").toString();
+        }
+
+        out.append("            log.info(\"").append(JavaLiteralEscaper.escape(note)).append("\");\n");
+        out.append("            log.info(e.getMessage());\n");
+
+        // The backup route. These steps only run because the first way through failed, so the
+        // log line above them is what tells a reviewer why the test took this path.
+        List<RecordedStep> recovery = flow.recoveryStepsFor(groupId);
+        for (RecordedStep step : recovery) {
+            StringBuilder stepOut = new StringBuilder();
+            renderStep(step, flow.getSteps(), -1, stepOut, locatorFieldName,
+                    extraImports, reusedClasses, instanceFields);
+            out.append(indentOneLevel(stepOut));
+        }
+        return out.append("        }\n").toString();
+    }
+
+    /** Pushes a step's generated lines one level in, so the try block reads as a block. */
+    private String indentOneLevel(CharSequence lines) {
+        StringBuilder out = new StringBuilder();
+        for (String line : lines.toString().split("\n", -1)) {
+            if (line.isEmpty()) continue;
+            out.append("    ").append(line).append("\n");
+        }
+        return out.toString();
     }
 
     /**

@@ -113,7 +113,7 @@ public class LocatorsClassGenerator {
             case EXACT_TEXT_XPATH -> "    @AndroidFindBy(xpath = \"%s\")\n".formatted(value);
             case TEXT_CONTAINS_UIAUTOMATOR, INDEX_BASED ->
                     "    @AndroidFindBy(uiAutomator = \"%s\")\n".formatted(value);
-            case CLASS_NAME_XPATH -> "    @AndroidFindBy(xpath = \"%s\")\n".formatted(value);
+            case CLASS_NAME_XPATH, INDEXED_UNDER_ANCHOR -> "    @AndroidFindBy(xpath = \"%s\")\n".formatted(value);
         };
     }
 }

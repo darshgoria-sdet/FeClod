@@ -1,5 +1,6 @@
 package com.jar.flowcapture.capture;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -9,6 +10,13 @@ import lombok.NoArgsConstructor;
  * priority already implicit in Jar_Frontend_Automation's locator classes:
  * resource-id > content-desc > exact text > uiAutomator textContains > index-based (last resort).
  */
+/**
+ * Derived getters (isBrittle, isUnique, …) are serialized by Jackson but have no setters, so
+ * reading a saved session back failed on its own output and every restart silently lost the
+ * in-progress recording. Ignoring unknown fields on the way in is the fix that also survives
+ * the next computed accessor someone adds.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
@@ -20,7 +28,17 @@ public class CandidateLocator {
         EXACT_TEXT_XPATH(3, false),
         TEXT_CONTAINS_UIAUTOMATOR(4, false),
         CLASS_NAME_XPATH(5, false),
-        INDEX_BASED(6, true);
+        /**
+         * A positional XPath scoped to the nearest ancestor carrying an id, e.g.
+         * (//*[@resource-id="home_pager"]//android.view.View)[7].
+         *
+         * Brittle — any layout change above it moves the index — but unique by construction,
+         * which is the point: it exists so that every element has at least one locator that
+         * identifies exactly one thing. Without it, a Compose node with no id, text or
+         * content-description had nothing to offer but a container XPath matching dozens.
+         */
+        INDEXED_UNDER_ANCHOR(6, true),
+        INDEX_BASED(7, true);
 
         public final int priority;
         public final boolean brittle;

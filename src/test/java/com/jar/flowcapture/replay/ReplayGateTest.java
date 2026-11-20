@@ -34,13 +34,13 @@ class ReplayGateTest {
     private ReplayReport passed() {
         return new ReplayReport("SomeFlow", List.of(
                 new StepResult(1, "TAP", "one", StepResult.Status.PASSED, null, 10, null)),
-                1, 0, 0, 0, 10);
+                1, 0, 0, 0, 0, 10);
     }
 
     private ReplayReport failed() {
         return new ReplayReport("SomeFlow", List.of(
                 new StepResult(1, "TAP", "one", StepResult.Status.FAILED, "nope", 10, null)),
-                0, 1, 0, 0, 10);
+                0, 1, 0, 0, 0, 10);
     }
 
     /** Having just watched a clean replay, QA should not be made to sit through another one. */

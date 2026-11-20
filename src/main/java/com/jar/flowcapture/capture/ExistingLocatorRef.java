@@ -1,5 +1,6 @@
 package com.jar.flowcapture.capture;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -11,6 +12,7 @@ import java.util.List;
  * an element QA just captured. Surfaced so the same element is not declared a third or
  * fourth time (measured: 16% of the repo's 452 locator values are redundant declarations).
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Data
 @AllArgsConstructor
 @NoArgsConstructor

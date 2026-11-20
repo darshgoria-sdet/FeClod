@@ -21,6 +21,15 @@ flow-capture:
   # Override with --flow-capture.target-repo-path=/abs/path when launching.
   target-repo-path: /Users/apple/Desktop/RegressionRun/TransactionsRevamp/Jar_Frontend_Automation
 
+  # Used by "Verify for real", which runs the generated TestNG class through Maven in the
+  # target repo. An absolute path, because the studio is usually started from a desktop app
+  # whose PATH does not include a Homebrew or SDKMAN maven.
+  maven-path: /Users/apple/tools/apache-maven-3.9.16/bin/mvn
+
+  # The repo compiles with --release 22; the studio itself is pinned to JDK 21 for Lombok.
+  # Leave blank to let Maven pick the system default JDK instead of inheriting the pin.
+  test-java-home: /Users/apple/Library/Java/JavaVirtualMachines/temurin-22.0.2/Contents/Home
+
   appium:
     server-url: http://127.0.0.1:4723
     platform-name: Android

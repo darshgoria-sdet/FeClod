@@ -16,6 +16,8 @@ public class ReplayReport {
     private int failed;
     private int skipped;
     private int notReached;
+    /** Steps that failed inside a try/catch set to carry on — reported, but not fatal. */
+    private int tolerated;
     private long totalMs;
 
     /** True only when nothing failed — the signal for "this flow is safe to generate". */
@@ -34,6 +36,8 @@ public class ReplayReport {
         }
         return (passed == 1 ? "The 1 executable step passed" : "All " + passed + " executable steps passed")
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
+                + (tolerated > 0 ? " — " + tolerated + " optional step" + (tolerated == 1 ? "" : "s")
+                        + " did not run, which the test tolerates" : "")
                 + " in " + (totalMs / 1000) + "s";
     }
 

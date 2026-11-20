@@ -305,3 +305,155 @@ kbd {
     flex-shrink: 0; width: 42px; border-radius: 4px; border: 1px solid #2c313d;
     align-self: flex-start;
 }
+
+/* --- Inspector --- */
+.screen-wrapper { position: relative; }
+.highlight-box {
+    position: absolute;
+    border: 2px solid #6fb3ff;
+    background: rgba(111, 179, 255, 0.14);
+    pointer-events: none;
+    box-sizing: border-box;
+    border-radius: 2px;
+}
+.inspect-toolbar { display: flex; gap: 6px; align-items: center; }
+.inspect-toolbar .action-search { flex: 1; min-width: 0; margin: 0; }
+.inspect-target {
+    margin: 0; font-size: 11.5px; color: #d9c27e;
+    border: 1px solid #4b422a; background: #1d1a13; border-radius: 4px; padding: 5px 8px;
+}
+.inspect-tree {
+    border: 1px solid #22262f; border-radius: 4px; background: #11141a;
+    /* min-height, not just max-height: the pane is a flex column, so without a floor the
+       tree is the first thing squeezed to nothing when the detail panel opens below it. */
+    min-height: 180px; max-height: 320px; flex: 1 1 auto;
+    overflow: auto; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+}
+.tree-row {
+    display: flex; align-items: center; gap: 4px; padding: 2px 6px;
+    white-space: nowrap; cursor: pointer; color: #c4cad6;
+}
+.tree-row:hover { background: #1a1f28; }
+.tree-row.selected { background: #243348; color: #eaf1ff; }
+.tree-row.dim { opacity: 0.4; }
+.tree-caret { width: 12px; flex-shrink: 0; color: #6b7280; text-align: center; }
+.tree-tag { color: #8fb0d9; }
+.tree-id { color: #9fe3ab; }
+.tree-text { color: #d9c27e; }
+.tree-count { color: #6b7280; }
+.inspect-detail {
+    border: 1px solid #22262f; border-radius: 4px; background: #11141a; padding: 8px;
+    display: flex; flex-direction: column; gap: 8px;
+    /* A Compose node carries ~25 attributes; letting that push the tree and the bench off
+       the pane would cost more than it shows. */
+    max-height: 380px; overflow: auto; flex-shrink: 0;
+}
+.detail-title { margin: 0; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.attr-table { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 11.5px; }
+.attr-name { color: #7d8595; font-family: ui-monospace, Menlo, monospace; }
+.attr-value { color: #c4cad6; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace; }
+.cand-list { display: flex; flex-direction: column; gap: 5px; }
+.cand-row {
+    display: flex; align-items: center; gap: 6px; padding: 5px 6px;
+    border: 1px solid #22262f; border-radius: 4px; background: #141821;
+}
+.cand-row.unique { border-color: #2f5c3a; }
+.cand-row.ambiguous { border-color: #6d3a3a; }
+.cand-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.cand-value { font-family: ui-monospace, Menlo, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.cand-meta { font-size: 10.5px; color: #7d8595; }
+.cand-meta.good { color: #7fc98f; }
+.cand-meta.bad { color: #ef9a9a; }
+.cand-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.cand-actions button { font-size: 11px; padding: 3px 7px; }
+.inspect-bench { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+.bench-title { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #9aa0ab; }
+.bench-row { display: flex; gap: 6px; }
+.bench-row select { width: 120px; flex-shrink: 0; }
+.bench-row input { flex: 1; min-width: 0; font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.bench-result { margin: 0; font-size: 11.5px; color: #a8aebb; overflow-wrap: anywhere; }
+.bench-result.good { color: #7fc98f; }
+.bench-result.bad { color: #ef9a9a; }
+.raw-xml {
+    width: 100%; height: 320px; background: #11141a; color: #c4cad6;
+    border: 1px solid #22262f; border-radius: 4px; padding: 8px;
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; resize: vertical;
+}
+.step-locator {
+    background: none; border: 1px solid #2a2f3a; color: #8a909c;
+    font-size: 10.5px; padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+}
+.step-locator:hover { color: #cdd3de; border-color: #3a4151; }
+
+/* A step whose element cannot be told apart from its neighbours — recorded, but not trustworthy. */
+.step-item.step-risky { border-left: 2px solid #6d5a2a; padding-left: 5px; }
+.step-warn { color: #d9c27e; font-size: 12px; flex-shrink: 0; cursor: help; }
+
+/* Inserting a step between two recorded ones. */
+.step-insert {
+    background: none; border: none; color: #4b5260;
+    font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0; cursor: pointer;
+}
+.step-insert:hover { color: #8fb0d9; background: none; }
+.insert-end {
+    align-self: flex-start; background: none; border: 1px dashed #2a2f3a;
+    color: #6b7280; font-size: 11.5px; padding: 3px 9px; border-radius: 4px;
+}
+.insert-end:hover { color: #cdd3de; border-color: #3a4151; background: none; }
+#insertSeconds { width: 90px; }
+
+/* Past flows */
+.library-list { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow: auto; }
+.library-row {
+    display: flex; align-items: center; gap: 8px; padding: 7px 9px;
+    border: 1px solid #22262f; border-radius: 4px; background: #141821;
+}
+.library-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.library-name { font-size: 12.5px; font-weight: 600; }
+.library-meta { font-size: 10.5px; color: #7d8595; overflow-wrap: anywhere; }
+.library-row button { flex-shrink: 0; font-size: 11px; padding: 3px 8px; }
+
+/* Steps wrapped in a try/catch block. */
+.step-item.step-wrapped { border-left: 2px solid #3f5a7a; padding-left: 5px; }
+.step-try {
+    background: none; border: 1px solid #2a2f3a; color: #7f93ad;
+    font-size: 10.5px; padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+}
+.step-try:hover { color: #cfe0f5; border-color: #3f5a7a; background: none; }
+.try-banner {
+    font-size: 10.5px; color: #7f93ad; padding: 1px 0 2px 24px;
+    display: flex; align-items: center; gap: 6px;
+}
+.try-banner button {
+    background: none; border: none; color: #6b7280; font-size: 10.5px; padding: 0;
+    text-decoration: underline; cursor: pointer;
+}
+.try-banner button:hover { color: #cdd3de; background: none; }
+.replay-row.failed_tolerated { border-color: #5c4a2a; background: #1c1812; }
+.replay-row.failed_tolerated .replay-mark { color: #d9c27e; }
+#tryFrom, #tryTo { width: 64px; }
+
+/* The real test run */
+.verify-box {
+    border: 1px solid #22262f; border-radius: 4px; background: #11141a;
+    padding: 9px; display: flex; flex-direction: column; gap: 7px;
+}
+.verify-output {
+    margin: 0; max-height: 260px; overflow: auto; background: #0c0f14;
+    border: 1px solid #1c2029; border-radius: 3px; padding: 7px;
+    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; line-height: 1.45;
+    color: #9aa3b2; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* Backup steps, and dragging steps around. */
+.step-item.step-backup { border-left: 2px solid #5c4a2a; padding-left: 5px; opacity: 0.88; }
+.step-item.dragging { opacity: 0.4; }
+.step-item.drop-above { box-shadow: inset 0 2px 0 0 #6fb3ff; }
+.step-item.drop-below { box-shadow: inset 0 -2px 0 0 #6fb3ff; }
+.step-grip {
+    cursor: grab; color: #4b5260; font-size: 12px; flex-shrink: 0;
+    padding: 0 1px; user-select: none;
+}
+.step-grip:active { cursor: grabbing; }
+.step-item.step-backup .step-text::before { content: "catch · "; color: #d9c27e; }
+#tryCatchFrom, #tryCatchTo { width: 64px; }

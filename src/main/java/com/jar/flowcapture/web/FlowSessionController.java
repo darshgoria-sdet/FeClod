@@ -9,6 +9,7 @@ import com.jar.flowcapture.execute.UtilityExecutor;
 import com.jar.flowcapture.mirror.ScreenMirrorService;
 import com.jar.flowcapture.replay.FlowReplayService;
 import com.jar.flowcapture.replay.ReplayGate;
+import com.jar.flowcapture.library.FlowLibraryService;
 import com.jar.flowcapture.settings.OutputPathService;
 import com.jar.flowcapture.replay.ReplayReport;
 import com.jar.flowcapture.reuse.LocatorIndexService;
@@ -47,6 +48,7 @@ public class FlowSessionController {
     private final ScreenMirrorService screenMirrorService;
     private final ReplayGate replayGate;
     private final OutputPathService outputPathService;
+    private final FlowLibraryService flowLibraryService;
 
     public FlowSessionController(AppiumSessionService appiumSessionService,
                                   FlowSessionService flowSessionService,
@@ -63,7 +65,8 @@ public class FlowSessionController {
                                   FlowReplayService flowReplayService,
                                   ScreenMirrorService screenMirrorService,
                                   ReplayGate replayGate,
-                                  OutputPathService outputPathService) {
+                                  OutputPathService outputPathService,
+                                  FlowLibraryService flowLibraryService) {
         this.appiumSessionService = appiumSessionService;
         this.flowSessionService = flowSessionService;
         this.clickResolverService = clickResolverService;
@@ -80,6 +83,7 @@ public class FlowSessionController {
         this.screenMirrorService = screenMirrorService;
         this.replayGate = replayGate;
         this.outputPathService = outputPathService;
+        this.flowLibraryService = flowLibraryService;
     }
 
     @PostMapping("/device/connect")
@@ -202,7 +206,8 @@ public class FlowSessionController {
         flow.addStep(step);
         flowSessionService.persistCurrentState();
 
-        return new StepResponse(step, suggestion, buildPreview(flow), existingLocatorFor(flow, step));
+        return new StepResponse(step, suggestion, buildPreview(flow), existingLocatorFor(flow, step),
+                locatorWarningFor(resolved.candidates()));
     }
 
     @Data
@@ -219,18 +224,59 @@ public class FlowSessionController {
         private final PreviewResponse preview;
         /** Non-null when this element's locator is already declared elsewhere in the repo and QA should be asked whether to reuse it. */
         private final ExistingLocatorRef existingLocator;
+        /**
+         * Non-null when the element this step captured has no locator that identifies it
+         * uniquely. Said at capture time because that is when the screen is still in front
+         * of the person who can fix it; left unsaid, it surfaces much later as a replay that
+         * passes without doing anything, or as a flaky generated test.
+         */
+        private final String locatorWarning;
 
         public StepResponse(RecordedStep step, ReusableMethod suggestedExistingMethod, PreviewResponse preview) {
-            this(step, suggestedExistingMethod, preview, null);
+            this(step, suggestedExistingMethod, preview, null, null);
         }
 
         public StepResponse(RecordedStep step, ReusableMethod suggestedExistingMethod,
                             PreviewResponse preview, ExistingLocatorRef existingLocator) {
+            this(step, suggestedExistingMethod, preview, existingLocator, null);
+        }
+
+        public StepResponse(RecordedStep step, ReusableMethod suggestedExistingMethod,
+                            PreviewResponse preview, ExistingLocatorRef existingLocator,
+                            String locatorWarning) {
             this.step = step;
             this.suggestedExistingMethod = suggestedExistingMethod;
             this.preview = preview;
             this.existingLocator = existingLocator;
+            this.locatorWarning = locatorWarning;
         }
+    }
+
+    /**
+     * Whether this element can be found again reliably, in one sentence.
+     *
+     * The ranker already counts each candidate against the captured screen, and when nothing
+     * resolves uniquely it returns the ambiguous ones anyway rather than offering nothing.
+     * That is the right call, but until now the count went no further than the data model:
+     * a tap whose only locator matched 104 elements was recorded, generated and replayed with
+     * nothing ever saying so.
+     */
+    private String locatorWarningFor(List<CandidateLocator> candidates) {
+        if (candidates == null || candidates.isEmpty()) return null;
+        CandidateLocator best = candidates.stream()
+                .filter(c -> c.getStrategy() != CandidateLocator.Strategy.INDEX_BASED)
+                .findFirst().orElse(null);
+        if (best == null) {
+            return "This element exposes no id, text or content-description — the only locator "
+                    + "available is an index placeholder you have to fill in by hand. "
+                    + "Open the Inspector to pick a usable one.";
+        }
+        if (best.isAmbiguous()) {
+            return "The best locator for this element matches " + best.getMatchCount()
+                    + " elements on this screen, so a click can land on the wrong one. "
+                    + "Open the Inspector and pick a locator that matches exactly one.";
+        }
+        return null;
     }
 
     /**
@@ -264,7 +310,8 @@ public class FlowSessionController {
         flow.addStep(step);
         flowSessionService.persistCurrentState();
 
-        return new StepResponse(step, null, buildPreview(flow), existingLocatorFor(flow, step));
+        return new StepResponse(step, null, buildPreview(flow), existingLocatorFor(flow, step),
+                locatorWarningFor(resolved.candidates()));
     }
 
     @Data
@@ -343,6 +390,131 @@ public class FlowSessionController {
         flowSessionService.persistCurrentState();
 
         return new StepResponse(step, null, buildPreview(flow));
+    }
+
+    /**
+     * Adds a step at a chosen position WITHOUT performing it on the device.
+     *
+     * This is the editing counterpart of /step/utility, and the difference is deliberate.
+     * Recording a step means doing it: the method runs, the app moves, and the step describes
+     * what happened. Inserting one between two existing steps cannot mean that — the phone is
+     * not on the screen that step belongs to, so running it there would either fail or, worse,
+     * do something to a screen the flow never visits at that point.
+     *
+     * So nothing runs. The flow gains a step, the generated code gains a line, and whether the
+     * sequence still works is a question for Replay — which can answer it, because it starts
+     * from the beginning.
+     */
+    @PostMapping("/step/insert")
+    public StepResponse insertStep(@RequestBody InsertStepRequest request) {
+        ReusableMethod method = methodCatalogService.byKind(request.getMethodKind())
+                .orElseThrow(() -> new IllegalArgumentException("Unknown utility method: " + request.getMethodKind()));
+
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        UtilityArgs args = request.getArgs() == null ? new UtilityArgs() : request.getArgs();
+        applyPresetArgs(method, args);
+        nameElementTargets(flow, method, args);
+
+        RecordedStep step = new RecordedStep();
+        step.setActionType(RecordedStep.ActionType.UTILITY_CALL);
+        step.setActionLabel(method.getHumanDescription());
+        step.setUtilityMethodKind(method.getKind().name());
+        step.setUtilityArgs(args);
+        // No thumbnail: the screen in front of us is not the screen this step belongs to, and a
+        // picture of the wrong screen is worse than none.
+
+        flow.insertStep(request.getAt(), step);
+        flowSessionService.persistCurrentState();
+        return new StepResponse(step, null, buildPreview(flow));
+    }
+
+    @Data
+    public static class InsertStepRequest {
+        /** 0 puts the step before the first one; a value equal to the step count appends. */
+        private int at;
+        private String methodKind;
+        private UtilityArgs args;
+    }
+
+    /**
+     * Wraps a run of steps in try/catch.
+     *
+     * Nothing is executed and nothing changes on the phone — this is purely a statement about
+     * how the generated test should treat a failure in those steps. Replay honours it too, so
+     * the check and the generated code agree about which steps are allowed to be missing.
+     */
+    @PostMapping("/try-block")
+    public StepResponse wrapInTryBlock(@RequestBody TryBlockRequest request) {
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        TryBlock block = new TryBlock();
+        block.setOnFailure(request.getOnFailure() == null ? TryBlock.OnFailure.CONTINUE : request.getOnFailure());
+        block.setNote(request.getNote());
+        if (block.getOnFailure() == TryBlock.OnFailure.FAIL_WITH_MESSAGE
+                && (block.getNote() == null || block.getNote().isBlank())) {
+            throw new IllegalArgumentException(
+                    "Say what went wrong — the whole point of this option is a better message than the driver's");
+        }
+        // Re-wrapping steps that already belong to a block moves them out of it; a block left
+        // with no steps would otherwise keep generating an empty try/catch.
+        flow.wrapSteps(request.getFrom(), request.getTo(), block);
+        if (block.getOnFailure() == TryBlock.OnFailure.RUN_RECOVERY_STEPS) {
+            if (request.getCatchFrom() == null || request.getCatchTo() == null) {
+                throw new IllegalArgumentException("Pick the steps that should run instead when the try fails");
+            }
+            flow.assignToCatch(request.getCatchFrom(), request.getCatchTo(), block.getId());
+            if (flow.recoveryStepsFor(block.getId()).isEmpty()) {
+                throw new IllegalArgumentException("A backup route with no steps in it would do nothing");
+            }
+        }
+        flow.pruneEmptyTryBlocks();
+        flowSessionService.persistCurrentState();
+        return new StepResponse(flow.getSteps().get(request.getFrom()), null, buildPreview(flow));
+    }
+
+    @DeleteMapping("/try-block/{id}")
+    public StepResponse removeTryBlock(@PathVariable String id) {
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        flow.unwrap(id);
+        flowSessionService.persistCurrentState();
+        return new StepResponse(null, null, buildPreview(flow));
+    }
+
+    @Data
+    public static class TryBlockRequest {
+        /** 0-based, inclusive on both ends. */
+        private int from;
+        private int to;
+        private TryBlock.OnFailure onFailure;
+        private String note;
+        /** Optional: the steps to run instead when the try fails — the backup route. */
+        private Integer catchFrom;
+        private Integer catchTo;
+    }
+
+    /**
+     * Moves a step to another position — what dragging it in the list does.
+     *
+     * Nothing runs on the device. Reordering a recorded flow is an edit, and whether the
+     * steps still work in the new order is a question only Replay can answer.
+     */
+    @PostMapping("/step/{index}/move")
+    public StepResponse moveStep(@PathVariable int index, @RequestBody MoveStepRequest request) {
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        flow.moveStep(index, request.getTo());
+        flowSessionService.persistCurrentState();
+        return new StepResponse(flow.getSteps().get(request.getTo()), null, buildPreview(flow));
+    }
+
+    @Data
+    public static class MoveStepRequest {
+        /** 0-based position the step should end up at. */
+        private int to;
+    }
+
+    /** The methods offered for insertion between steps: pure timing, nothing that moves the app. */
+    @GetMapping("/insertable-waits")
+    public List<ReusableMethod> insertableWaits() {
+        return methodCatalogService.insertableWaits();
     }
 
     /**
@@ -534,6 +706,57 @@ public class FlowSessionController {
         return new StepResponse(steps.get(index), null, buildPreview(flow));
     }
 
+    /**
+     * QA picked a locator in the inspector for an element argument. Wraps it the same way a
+     * tap-resolved element is wrapped, so the param modal treats both identically, and still
+     * checks whether the repo already declares it — a hand-picked locator is just as worth
+     * reusing as a captured one.
+     */
+    @PostMapping("/adopt-locator")
+    public ResolveElementResponse adoptLocator(@RequestBody CandidateLocator chosen) {
+        if (chosen == null || chosen.getValue() == null || chosen.getValue().isBlank()) {
+            throw new IllegalArgumentException("Pick a locator first");
+        }
+        List<CandidateLocator> candidates = List.of(chosen);
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        String generating = NameUtils.toClassName(flow.getFlowName()) + "Locators";
+        return new ResolveElementResponse(candidates,
+                locatorIndexService.findExisting(candidates, generating).orElse(null));
+    }
+
+    /**
+     * Replaces a recorded step's locator with one QA chose in the inspector.
+     *
+     * The chosen locator becomes the only candidate rather than being pushed to the front of
+     * the ranked list: a deliberate choice should not be silently fallen back from. Any
+     * earlier "reuse the repo's declaration" decision is dropped, because it referred to the
+     * locator being replaced.
+     */
+    @PostMapping("/step/{index}/locator")
+    public StepResponse setStepLocator(@PathVariable int index, @RequestBody CandidateLocator chosen) {
+        if (chosen == null || chosen.getValue() == null || chosen.getValue().isBlank()) {
+            throw new IllegalArgumentException("Pick a locator first");
+        }
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        List<RecordedStep> steps = flow.getSteps();
+        if (index < 0 || index >= steps.size()) {
+            throw new IllegalArgumentException("No step at position " + (index + 1)
+                    + " — this flow has " + steps.size() + " step(s)");
+        }
+        RecordedStep step = steps.get(index);
+        if (step.getCandidateLocators() == null || step.getCandidateLocators().isEmpty()) {
+            throw new IllegalArgumentException("Step " + (index + 1) + " has no element of its own to re-point");
+        }
+        step.setCandidateLocators(new ArrayList<>(List.of(chosen)));
+        step.setReusedLocator(null);
+        step.setVerifiedBeforeWrite(null);
+        flowSessionService.persistCurrentState();
+        // Warn here too: the Inspector shows the match count next to every candidate, but a
+        // deliberate choice of an ambiguous one should still be said out loud afterwards.
+        return new StepResponse(step, null, buildPreview(flow), existingLocatorFor(flow, step),
+                locatorWarningFor(step.getCandidateLocators()));
+    }
+
     /** Every catalogued method that needs arguments, with its parameter shapes, so the dashboard can build modals generically. */
     @GetMapping("/parameterised-actions")
     public List<ReusableMethod> parameterisedActions() {
@@ -591,6 +814,9 @@ public class FlowSessionController {
     public StepResponse deleteStep(@PathVariable int index) {
         RecordedFlow flow = flowSessionService.requireCurrentFlow();
         RecordedStep removed = flow.removeStep(index);
+        // Removing the last step of a try block would otherwise leave the block behind,
+        // generating an empty try/catch around nothing.
+        flow.pruneEmptyTryBlocks();
         flowSessionService.persistCurrentState();
         return new StepResponse(removed, null, buildPreview(flow));
     }
@@ -750,12 +976,22 @@ public class FlowSessionController {
                     "Blocking style errors found — files NOT written. Fix generator output and retry.", gateReport);
         }
 
+        // What this tool wrote to these three files last time it generated THIS flow, if it
+        // ever did. Without it, regenerating a re-opened flow could only ever produce another
+        // *GeneratedDraft.java — the file you actually run would never change.
+        var previous = flowLibraryService.load(flow.getId()).orElse(null);
+
         var locatorsWrite = fileWriterService.writeLocatorsClass(
-                area.getLocatorsRelativePath(), locatorsResult.className(), locatorsContent, request.isAllowOverwrite());
+                area.getLocatorsRelativePath(), locatorsResult.className(), locatorsContent,
+                request.isAllowOverwrite(), hashOf(previous == null ? null : previous.getLocatorsFile()));
         var pageWrite = fileWriterService.writePageClass(
-                area.getPageRelativePath(), pageResult.className(), pageContent, request.isAllowOverwrite());
+                area.getPageRelativePath(), pageResult.className(), pageContent,
+                request.isAllowOverwrite(), hashOf(previous == null ? null : previous.getPageFile()));
         var testWrite = fileWriterService.writeTestClass(
-                area.getTestRelativePath(), testResult.className(), testContent, request.isAllowOverwrite());
+                area.getTestRelativePath(), testResult.className(), testContent,
+                request.isAllowOverwrite(), hashOf(previous == null ? null : previous.getTestFile()));
+
+        archiveFinishedFlow(flow, locatorsWrite, locatorsContent, pageWrite, pageContent, testWrite, testContent);
 
         flowSessionService.endFlow();
         replayGate.clear();
@@ -800,6 +1036,76 @@ public class FlowSessionController {
         ReplayReport report = flowReplayService.replay(flow, true);
         replayGate.record(flow, report);
         return report;
+    }
+
+    private String hashOf(FlowLibraryService.WrittenFile file) {
+        return file == null ? null : file.getSha256();
+    }
+
+    /**
+     * Keeps the recording after the files are written, with a fingerprint of each file.
+     *
+     * Finishing used to be the end of a flow: the Java landed in the repo and the steps that
+     * produced it were dropped, so changing one step later meant recording the whole journey
+     * again. Saving it here is what makes a generated test something you can re-open, adjust
+     * and regenerate — and the fingerprints are what let that regeneration update its own
+     * output without ever overwriting something a person has edited since.
+     */
+    private void archiveFinishedFlow(RecordedFlow flow,
+                                     FileWriterService.WriteResult locatorsWrite, String locatorsContent,
+                                     FileWriterService.WriteResult pageWrite, String pageContent,
+                                     FileWriterService.WriteResult testWrite, String testContent) {
+        var saved = new FlowLibraryService.SavedFlow();
+        saved.setFlow(flow);
+        saved.setFinishedAt(java.time.Instant.now());
+        saved.setLocatorsFile(new FlowLibraryService.WrittenFile(
+                locatorsWrite.getPath().toString(), locatorsContent, locatorsWrite.isCollisionAvoided()));
+        saved.setPageFile(new FlowLibraryService.WrittenFile(
+                pageWrite.getPath().toString(), pageContent, pageWrite.isCollisionAvoided()));
+        saved.setTestFile(new FlowLibraryService.WrittenFile(
+                testWrite.getPath().toString(), testContent, testWrite.isCollisionAvoided()));
+        flowLibraryService.save(saved);
+    }
+
+    /** Every finished flow, newest first — the dashboard's "open a past flow" list. */
+    @GetMapping("/library")
+    public List<FlowLibraryService.Summary> library() {
+        return flowLibraryService.list();
+    }
+
+    /**
+     * Re-opens a finished flow for editing. Refuses while another recording is in progress
+     * rather than silently replacing it — losing an unfinished recording to a mis-click is
+     * exactly the kind of thing this tool should not do.
+     */
+    @PostMapping("/library/{id}/open")
+    public Map<String, Object> openSavedFlow(@PathVariable String id) {
+        if (flowSessionService.hasActiveFlow()) {
+            throw new IllegalArgumentException(
+                    "Finish or discard the flow you have open before opening another one");
+        }
+        var saved = flowLibraryService.load(id)
+                .orElseThrow(() -> new IllegalArgumentException("No saved flow with id " + id));
+        RecordedFlow flow = flowSessionService.adoptFlow(saved.getFlow());
+        // The gate belongs to the previous generation of this flow, not to whatever is about
+        // to be edited into it.
+        replayGate.clear();
+        // All three, not just the test: a hand edit to the Page class is the likeliest one of
+        // the three to exist, and reporting on the test file alone would promise a clean
+        // regeneration that the writer is then going to refuse.
+        boolean untouched = flowLibraryService.isUnchangedSinceWrite(saved.getLocatorsFile())
+                && flowLibraryService.isUnchangedSinceWrite(saved.getPageFile())
+                && flowLibraryService.isUnchangedSinceWrite(saved.getTestFile());
+        return Map.of(
+                "flow", flow,
+                "preview", buildPreview(flow),
+                "filesStillUntouched", untouched);
+    }
+
+    @DeleteMapping("/library/{id}")
+    public Map<String, Object> forgetSavedFlow(@PathVariable String id) {
+        flowLibraryService.delete(id);
+        return Map.of("deleted", true);
     }
 
     /** Blank counts as absent: an accidentally cleared editor must not write an empty file. */

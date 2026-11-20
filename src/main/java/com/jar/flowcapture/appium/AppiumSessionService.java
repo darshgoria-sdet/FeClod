@@ -444,6 +444,25 @@ public class AppiumSessionService {
         return found;
     }
 
+    /**
+     * Clicks an element that a caller has already waited for and vetted.
+     *
+     * Separate from clickFirstVisible because replay needs to do something between finding
+     * the element and clicking it — check that the locator identifies only one — and
+     * re-entering the wait loop just to issue the click would hide that gap rather than
+     * close it.
+     */
+    public synchronized void clickResolved(By by) {
+        requireElement(by).click();
+    }
+
+    /** The typing counterpart of clickResolved, for an element already found and vetted. */
+    public synchronized void typeIntoResolved(By by, String text) {
+        WebElement element = requireElement(by);
+        element.click();
+        element.sendKeys(text == null ? "" : text);
+    }
+
     public synchronized boolean clickElement(By by, int timeoutSeconds) {
         return clickFirstVisible(List.of(by), timeoutSeconds) != null;
     }

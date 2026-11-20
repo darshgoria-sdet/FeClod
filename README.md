@@ -150,6 +150,95 @@ Configuration lives in `src/main/resources/application.yml` — notably
 - A three-pane dashboard (Thymeleaf + vanilla JS): device mirror + controls,
   step log with per-step thumbnails and a target-area picker, and a live
   generated-code preview with Locators/Page/Test tabs.
+- **An element with no identity of its own borrows it from the label inside it.** This was
+  the recurring failure: a Jetpack Compose card is a bare `android.view.View` with no id, no
+  text and no content-description, so the only locator the ranker could build was an
+  ancestor-scoped XPath anchored on `nav_host_fragment` — 104 matches on the profile screen,
+  every single time, on every card. The identity was always one level down, on the label
+  inside the card, and tapping that label works because a click is dispatched at the
+  element's centre, inside the clickable parent. Measured on the live profile screen: every
+  clickable tile now has a locator matching exactly one element.
+- **Every element is guaranteed at least one unique locator.** `INDEXED_UNDER_ANCHOR` is a
+  positional XPath scoped to the nearest ancestor with an id, e.g.
+  `(//*[@resource-id="home_pager"]//android.view.View)[7]`. Brittle and flagged as such, but
+  unique by construction — so "nothing here identifies a single element" can never again be
+  the best the tool can do. Counting now evaluates the real XPath rather than pattern-matching
+  its shape, so an expression of any form is counted honestly.
+- **A catch can run its own steps** — the backup route. `TryBlock.RUN_RECOVERY_STEPS` plus
+  `RecordedStep.catchGroup`: record the fallback steps like any others, then point the try
+  block at them. They are generated inside the catch and, in Replay, run at the moment the
+  try fails, in the state the failure left behind. A backup step that fails too is a real
+  failure — the catch was the second attempt, there is no third.
+- **Steps can be dragged into a different order** (`RecordedFlow.moveStep`,
+  `POST /step/{index}/move`, the grip on each row). Recording can only append, and the order
+  you explore a screen in is not always the order the test should run in.
+- **"Verify for real"** (`RealTestRunService`, `POST /verify`, `GET /verify/status`) runs the
+  generated TestNG class through Maven in the target repo, against the phone. Step replay
+  checks the step list; once a flow carries a try/catch or a hand edit that is no longer the
+  program that was written, and replay can never see a missing import, a class that forgets
+  to extend `BaseSetup`, or a locator PageFactory resolves differently from `findElements`.
+  A one-class suite is written under `target/flow-capture/` (gitignored) carrying the repo's
+  own listeners and its `env` parameter — running with `-Dtest=` instead would drop the
+  suite and fail for reasons unrelated to the flow. The studio releases its Appium session
+  first, because the device holds one UiAutomator2 session at a time. `test-java-home`
+  exists because the studio is pinned to JDK 21 for Lombok while the repo compiles with
+  `--release 22`, and a child Maven inherits that pin.
+- **Draft files are renamed to match their filename.** A collision wrote
+  `public class FooPage` into `FooPageGeneratedDraft.java` — which Java will not compile,
+  and which duplicates the real class, so the whole module fails to build. Three such files
+  in the target repo made `mvn test` die before any test ran, behind a cascade of "cannot
+  find symbol" from Lombok never getting to run. The class and its constructors are now
+  renamed in the draft.
+- **Steps can be wrapped in try/catch** (`TryBlock`, `POST /try-block`, the `try` button on
+  each step row). For the optional screen — a coupon sheet, a permission prompt, a dialog
+  that shows on some runs. The generated shape matches `HandlingBottomSheets`, which is how
+  the repo already writes this by hand: `@Slf4j` on the class, `log.info(note)` then
+  `log.info(e.getMessage())` in the catch. The other option, "still fail, with my message",
+  throws an `AssertionError` carrying the flow author's sentence instead of "no such
+  element". Replay honours both: a failure inside a carry-on block is reported as
+  `FAILED_TOLERATED` and stepped over, because aborting there would make the check stricter
+  than the code it stands in for. Membership lives on the step (`RecordedStep.tryGroup`),
+  not as a pair of indexes on the block, so inserting or deleting a step can never slide a
+  try block onto steps nobody meant to wrap.
+- **Finished flows are kept and can be re-opened** (`FlowLibraryService`, `GET /library`,
+  `POST /library/{id}/open`, the "Past flows" button). Finishing used to be the end of a
+  recording: the Java landed in the repo and the steps that produced it were dropped, so
+  changing one step later meant walking the whole journey on the phone again. Re-opening
+  brings the steps back; a second finish **updates the same files**, which it can do safely
+  because each entry remembers a SHA-256 of exactly what it wrote. A file that has changed
+  since — hand-edited, merged, or never written by this tool — still gets a
+  `*GeneratedDraft.java` beside it and is never overwritten, and re-opening says so upfront.
+- **Waits can be inserted between recorded steps** (`RecordedFlow.insertStep`,
+  `POST /step/insert`, the `+` on each step row). Recording can only append — it follows
+  someone using a phone in real time — but the commonest repair after a replay is "this
+  screen needs a moment", and that belongs between two steps that already exist. Inserting
+  runs nothing on the device: the phone is not on that screen, so performing it there would
+  be meaningless. A fixed wait does now really sleep during replay, because a replay that
+  skips it checks a faster flow than the test it is standing in for.
+- **Ambiguity is a failure, not a pass.** A replayed tap or text entry checks that its
+  locator resolves to exactly one element before clicking. Finding "an" element is not
+  finding the right one: a container-scoped XPath matching 104 views clicks the first,
+  throws nothing, and otherwise reports PASSED while the app has not moved. The same
+  count is shown on the step the moment it is recorded, and in the Inspector next to
+  every candidate.
+- **Text locators are built from the untrimmed attribute.** Compose labels in this app
+  carry padding nobody sees — the profile tiles expose `"Offers \n"`. Trimming before
+  building the locator produced `//android.widget.TextView[@text="Offers"]`, which reads
+  correctly, counted as unique against the same trimmed value, and matched nothing on the
+  device. Padded text now gets `normalize-space(@text)=` (and `textContains` for the
+  UiSelector form); clean text keeps the exact form the repo's own locators use.
+- **An element inspector** (`PageSourceTreeService`, `InspectorController`, the
+  Inspector tab) — the device's whole element tree with every attribute and each
+  node's absolute XPath, the way Appium Inspector shows it, plus the thing
+  Inspector does not show: how many elements each candidate locator actually
+  matches on that screen. Clicking the mirror while the tab is open selects the
+  node under your finger instead of tapping the phone, and the selected node's
+  bounds are drawn over the mirror. A chosen locator can be applied to a recorded
+  step (`POST /step/{index}/locator`) or to an element argument a parameterised
+  method is waiting for (`POST /adopt-locator`). The locator bench
+  (`POST /inspect/test-locator`) runs any selector against the live device and
+  reports the match count, whether the match is on screen, and how long the
+  lookup took — a malformed XPath comes back as a result, not an error page.
 - Unit tests for the parts worth locking in against regressions: click
   resolution and locator ranking, name sanitization edge cases (digit-leading
   labels, all-symbol input), the scroll-then-tap codegen inference, test-class

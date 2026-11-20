@@ -41,6 +41,9 @@
                 <div id="pickOverlay" class="pick-overlay hidden">
                     <span id="pickOverlayText">Tap the element on the screen</span>
                 </div>
+                <!-- Draws the selected node's bounds over the mirror, so the tree row and the
+                     thing on the phone are visibly the same element. -->
+                <div id="highlightBox" class="highlight-box hidden"></div>
             </div>
             <p class="hint">Click to tap &middot; <kbd>Shift</kbd>+click to type into a field</p>
             <div class="screen-actions">
@@ -73,19 +76,25 @@
                 </div>
                 <div class="flow-row">
                     <button id="startFlowBtn" class="primary">Start Recording</button>
+                    <button id="openLibraryBtn" title="Re-open a flow you already generated">Past flows</button>
                     <button id="replayBtn" disabled title="Run every recorded step back against the device">Replay</button>
                     <button id="finishFlowBtn" disabled>Finish &amp; Generate</button>
+                    <button id="verifyBtn" title="Run the generated TestNG class through Maven against the phone">Verify for real</button>
                 </div>
             </section>
 
             <div class="tabs">
                 <button class="pane-tab active" data-pane="stepsPane">Steps <span id="stepCount" class="count">0</span></button>
                 <button class="pane-tab" data-pane="actionsPane">Existing methods <span id="actionCount" class="count">0</span></button>
+                <button class="pane-tab" data-pane="inspectorPane">Inspector</button>
             </div>
 
             <section id="stepsPane" class="pane">
                 <ol id="stepsList"></ol>
                 <p id="stepsEmpty" class="empty-note">No steps yet. Start recording, then tap the screen.</p>
+
+                <button id="appendWaitBtn" class="insert-end hidden"
+                        title="Add a wait at the end of the flow">+ wait at the end</button>
 
                 <section id="suggestionBox" class="suggestion-box hidden">
                     <p id="suggestionText"></p>
@@ -106,6 +115,19 @@
                     <ol id="replayResults" class="replay-results"></ol>
                 </section>
 
+                <!-- The real test, not a simulation of it. Lives beside the replay box because
+                     it answers the same question at the other end of the scale: replay checks
+                     the steps quickly, this runs the actual TestNG class through Maven. -->
+                <section id="verifyBox" class="verify-box hidden">
+                    <div class="replay-head">
+                        <h2>Real test run</h2>
+                        <span id="verifyStop" class="link-btn hidden">Stop</span>
+                        <button id="verifyCloseBtn" class="link-btn">Close</button>
+                    </div>
+                    <p id="verifySummary" class="replay-summary"></p>
+                    <pre id="verifyOutput" class="verify-output"></pre>
+                </section>
+
                 <section id="resultBox" class="result-box hidden">
                     <h2>Result</h2>
                     <pre id="resultText"></pre>
@@ -123,6 +145,38 @@
                     on your device and records the call, so the generated page object reuses it.
                     <span id="locatorIndexStatus" class="index-status"></span>
                 </p>
+            </section>
+
+            <!-- The element tree, the way Appium Inspector shows it, plus what Inspector does
+                 not show: how many elements each candidate locator actually matches on this
+                 screen. The ranker picks a default; this is where a human overrules it. -->
+            <section id="inspectorPane" class="pane hidden">
+                <div class="inspect-toolbar">
+                    <button id="inspectRefreshBtn">Capture screen</button>
+                    <input id="inspectSearch" class="action-search" placeholder="Filter by id, text or class" />
+                    <button id="inspectRawBtn" class="link-btn">Raw XML</button>
+                </div>
+                <p id="inspectTarget" class="inspect-target hidden"></p>
+                <p id="inspectHint" class="hint">
+                    Click the phone to select the element under your finger &mdash; nothing is tapped
+                    and nothing is recorded while this tab is open.
+                </p>
+                <div id="inspectTree" class="inspect-tree"></div>
+                <div id="inspectDetail" class="inspect-detail hidden"></div>
+                <div class="inspect-bench">
+                    <p class="bench-title">Try a locator on the device</p>
+                    <div class="bench-row">
+                        <select id="benchStrategy">
+                            <option value="RESOURCE_ID">resource-id</option>
+                            <option value="CONTENT_DESC">content-desc</option>
+                            <option value="EXACT_TEXT_XPATH">xpath</option>
+                            <option value="TEXT_CONTAINS_UIAUTOMATOR">uiAutomator</option>
+                        </select>
+                        <input id="benchValue" placeholder="//*[@resource-id=&quot;...&quot;]" />
+                        <button id="benchRunBtn">Test</button>
+                    </div>
+                    <p id="benchResult" class="bench-result"></p>
+                </div>
             </section>
         </div>
 
@@ -222,6 +276,158 @@
         <div class="modal-buttons">
             <button id="reuseAcceptBtn" class="primary">Use existing</button>
             <button id="reuseDeclineBtn">Create new</button>
+        </div>
+    </div>
+</div>
+
+<!-- Running the generated test for real. -->
+<div id="verifyModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p class="modal-title">Run the generated test</p>
+        <p class="modal-desc">
+            Maven runs the real TestNG class against the phone, through the repo's own
+            <code>BaseSetup</code> and listeners &mdash; try/catch, hand edits and all. It takes a
+            few minutes, and the studio has to <strong>hand the device over</strong> for the
+            duration: the session here is closed first, and you reconnect afterwards.
+        </p>
+        <div class="param-field">
+            <label for="verifyClass">Test class</label>
+            <input id="verifyClass" placeholder="com.jar.testCases.goldTestCase.Test4Test" />
+        </div>
+        <div class="param-field">
+            <label for="verifyEnv">Environment (the suite's <code>env</code> parameter)</label>
+            <select id="verifyEnv">
+                <option value="PHYSICAL_DEVICE">PHYSICAL_DEVICE</option>
+                <option value="EMULATOR">EMULATOR</option>
+                <option value="BROWSERSTACK">BROWSERSTACK</option>
+            </select>
+        </div>
+        <div class="modal-buttons">
+            <button id="verifyRunBtn" class="primary">Run it</button>
+            <button id="verifyCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Wrapping steps in try/catch: the optional-screen problem. -->
+<div id="tryModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p id="tryModalTitle" class="modal-title">Wrap steps in try/catch</p>
+        <p class="modal-desc">
+            For steps that are allowed not to happen &mdash; a coupon sheet, a permission prompt,
+            a dialog that only shows on some runs. Replay honours this too, so a wrapped step
+            that fails no longer stops the run.
+        </p>
+        <div class="param-field">
+            <label>Which steps?</label>
+            <div class="element-picker">
+                <span class="hint">from step</span>
+                <input id="tryFrom" type="number" min="1" />
+                <span class="hint">to step</span>
+                <input id="tryTo" type="number" min="1" />
+            </div>
+        </div>
+        <div class="param-field">
+            <label for="tryOnFailure">If they fail</label>
+            <select id="tryOnFailure">
+                <option value="CONTINUE">Log it and carry on</option>
+                <option value="RUN_RECOVERY_STEPS">Run other steps instead (backup route)</option>
+                <option value="FAIL_WITH_MESSAGE">Still fail, with my message</option>
+            </select>
+        </div>
+        <div id="tryCatchRange" class="param-field hidden">
+            <label>Which steps are the backup?</label>
+            <div class="element-picker">
+                <span class="hint">from step</span>
+                <input id="tryCatchFrom" type="number" min="1" />
+                <span class="hint">to step</span>
+                <input id="tryCatchTo" type="number" min="1" />
+            </div>
+            <p class="hint">
+                Record them like any other step first, then point at them here. They run only
+                when the try fails &mdash; in Replay too, not just in the generated code.
+            </p>
+        </div>
+        <div class="param-field">
+            <label for="tryNote">Why? (this becomes the logged or thrown message)</label>
+            <input id="tryNote" placeholder="e.g. the coupon sheet is not shown on every run" />
+        </div>
+        <div class="modal-buttons">
+            <button id="tryConfirmBtn" class="primary">Wrap</button>
+            <button id="tryCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Finished flows. Generating used to be the end of a recording; keeping it is what makes
+     "add a wait and regenerate" possible without walking the whole journey again. -->
+<div id="libraryModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p class="modal-title">Past flows</p>
+        <p class="modal-desc">
+            Re-opening a flow brings back its steps, not the file you may have edited since.
+            Generating again updates the same files, unless they have been changed by hand —
+            then it writes a <code>*GeneratedDraft.java</code> alongside and tells you.
+        </p>
+        <div id="libraryList" class="library-list"></div>
+        <p id="libraryEmpty" class="empty-note hidden">No flows generated yet.</p>
+        <div class="modal-buttons">
+            <button id="libraryCloseBtn">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Inserting a wait between two recorded steps. Nothing runs on the device: the phone is
+     not on the screen this step belongs to, so performing it here would be meaningless. -->
+<div id="insertModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p id="insertModalTitle" class="modal-title">Insert a wait</p>
+        <p class="modal-desc">
+            Nothing happens on the phone now — the step is added to the flow and to the generated
+            code. Run Replay afterwards to see whether it fixed the timing.
+        </p>
+        <select id="insertKind">
+            <option value="WAIT_FOR_VISIBILITY">Wait until an element is visible</option>
+            <option value="WAIT_FOR_SECONDS">Wait a fixed number of seconds</option>
+            <option value="WAIT_FOR_PRESENCE">Wait until an element is in the hierarchy</option>
+        </select>
+
+        <div id="insertSecondsField" class="param-field hidden">
+            <label for="insertSeconds">How many seconds?</label>
+            <input id="insertSeconds" type="number" min="1" max="120" value="3" />
+            <p class="hint">
+                A fixed sleep waits whether or not it needs to. Prefer waiting for the element
+                when you can name one &mdash; it is faster when the app is quick and safer when it is slow.
+            </p>
+        </div>
+
+        <div id="insertElementField" class="param-field">
+            <label for="insertElementValue">Which element should it wait for?</label>
+            <div class="element-picker">
+                <select id="insertElementKind">
+                    <option value="TEXT">visible text</option>
+                    <option value="RESOURCE_ID">resource-id</option>
+                    <option value="CONTENT_DESC">content-desc</option>
+                </select>
+                <input id="insertElementValue" placeholder="e.g. Save in Gold" />
+            </div>
+            <p class="hint">The element on the screen this wait belongs to, not the one on screen now.</p>
+        </div>
+
+        <div class="modal-buttons">
+            <button id="insertConfirmBtn" class="primary">Insert</button>
+            <button id="insertCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- The page source itself, for when the tree is not enough. -->
+<div id="rawModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p class="modal-title">Page source</p>
+        <textarea id="rawXml" class="raw-xml" spellcheck="false" readonly></textarea>
+        <div class="modal-buttons">
+            <button id="rawCloseBtn" class="primary">Close</button>
         </div>
     </div>
 </div>

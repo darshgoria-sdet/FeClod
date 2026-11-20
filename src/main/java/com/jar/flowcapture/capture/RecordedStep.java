@@ -1,5 +1,6 @@
 package com.jar.flowcapture.capture;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.Data;
 
 import java.util.List;
@@ -9,6 +10,7 @@ import java.util.List;
  * scroll (QA presses "I scrolled" rather than us inferring gestures from screenshots —
  * explicit beats inferred for v1 reliability).
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Data
 public class RecordedStep {
 
@@ -72,4 +74,19 @@ public class RecordedStep {
      * locator that looked fine when recorded but silently stopped matching.
      */
     private Boolean verifiedBeforeWrite;
+
+    /**
+     * The id of the TryBlock this step belongs to, or null when it stands on its own.
+     *
+     * Membership lives on the step rather than as a range on the block so that inserting or
+     * deleting a step cannot quietly move the boundaries of a try block onto steps nobody
+     * meant to wrap.
+     */
+    private String tryGroup;
+
+    /**
+     * The id of the TryBlock whose CATCH this step belongs to — a backup step, run only when
+     * the try failed. A step is in a try or in a catch, never both.
+     */
+    private String catchGroup;
 }

@@ -81,6 +81,14 @@ public class FlowReplayService {
                 continue;
             }
 
+            // A recovery step runs only if the try it backs up failed, so it is not part of
+            // the main sequence. It is executed from the catch, below, and reported there.
+            if (step.getCatchGroup() != null) {
+                results.add(new StepResult(number, String.valueOf(step.getActionType()), label(step),
+                        StepResult.Status.SKIPPED, "Backup step — runs only if its try block fails", 0, null));
+                continue;
+            }
+
             long stepStart = System.currentTimeMillis();
             StepResult result;
             try {
@@ -98,19 +106,74 @@ public class FlowReplayService {
             }
             results.add(result);
 
+            // A failure inside a try/catch that carries on is reported and then stepped over,
+            // because that is exactly what the generated test will do. Aborting here would
+            // make the replay stricter than the code it is standing in for, and would stop a
+            // flow on the one screen that was marked as optional in the first place.
+            if (result.getStatus() == StepResult.Status.FAILED && tolerates(flow, step)) {
+                result.setStatus(StepResult.Status.FAILED_TOLERATED);
+                // The backup route. Running it here, at the moment the try failed, is what
+                // makes the replay match the generated code: the catch body executes in the
+                // state the failure left behind, not at the end of the flow.
+                aborted = !runRecovery(flow, step.getTryGroup(), results);
+            }
             if (result.getStatus() == StepResult.Status.FAILED) {
                 aborted = true;
             }
         }
 
+        int tolerated = count(results, StepResult.Status.FAILED_TOLERATED);
         int passed = count(results, StepResult.Status.PASSED);
         int failed = count(results, StepResult.Status.FAILED);
         int skipped = count(results, StepResult.Status.SKIPPED);
         int notReached = count(results, StepResult.Status.NOT_REACHED);
         ReplayReport report = new ReplayReport(flow.getFlowName(), results, passed, failed, skipped,
-                notReached, System.currentTimeMillis() - started);
+                notReached, tolerated, System.currentTimeMillis() - started);
         log.info("Replay of '{}': {}", flow.getFlowName(), report.getSummary());
         return report;
+    }
+
+    /**
+     * Runs a block's backup steps after its try failed.
+     *
+     * Their results are appended to the report as they run, so the report reads in execution
+     * order — which is the only order that explains what the device did. A backup step that
+     * fails is a real failure: the catch was the second attempt, and there is no third.
+     *
+     * @return true when the flow can carry on
+     */
+    private boolean runRecovery(RecordedFlow flow, String blockId, List<StepResult> results) {
+        List<RecordedStep> recovery = flow.recoveryStepsFor(blockId);
+        if (recovery.isEmpty()) return true;
+
+        log.info("Try block failed — running {} backup step(s)", recovery.size());
+        for (RecordedStep step : recovery) {
+            int number = flow.getSteps().indexOf(step) + 1;
+            long stepStart = System.currentTimeMillis();
+            StepResult result;
+            try {
+                result = runStep(step, number);
+            } catch (Exception e) {
+                result = new StepResult(number, String.valueOf(step.getActionType()), label(step),
+                        StepResult.Status.FAILED, messageOf(e), 0, null);
+            }
+            result.setElapsedMs(System.currentTimeMillis() - stepStart);
+            result.setLabel("(backup) " + result.getLabel());
+            result.setScreenshotBase64(screenshotSafely());
+            // Replace the "skipped — runs only if its try fails" placeholder with what happened.
+            results.removeIf(r -> r.getStepNumber() == number
+                    && r.getStatus() == StepResult.Status.SKIPPED);
+            results.add(result);
+            if (result.getStatus() == StepResult.Status.FAILED) return false;
+        }
+        return true;
+    }
+
+    /** Whether this step sits in a try/catch block whose answer to a failure is "carry on". */
+    private boolean tolerates(RecordedFlow flow, RecordedStep step) {
+        return flow.tryBlock(step.getTryGroup())
+                .map(block -> block.getOnFailure() != com.jar.flowcapture.capture.TryBlock.OnFailure.FAIL_WITH_MESSAGE)
+                .orElse(false);
     }
 
     private StepResult runStep(RecordedStep step, int number) {
@@ -128,11 +191,17 @@ public class FlowReplayService {
                     return new StepResult(number, type, label, StepResult.Status.FAILED,
                             "No executable locator — the only candidate is index-based", 0, null);
                 }
-                By hit = appium.clickFirstVisible(locators, STEP_TIMEOUT_SECONDS);
-                return hit != null
-                        ? new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null)
-                        : new StepResult(number, type, label, StepResult.Status.FAILED,
-                                notFoundMessage(locators), 0, null);
+                By hit = appium.findFirstVisible(locators, STEP_TIMEOUT_SECONDS);
+                if (hit == null) {
+                    return new StepResult(number, type, label, StepResult.Status.FAILED,
+                            notFoundMessage(locators), 0, null);
+                }
+                String ambiguity = ambiguityOf(hit);
+                if (ambiguity != null) {
+                    return new StepResult(number, type, label, StepResult.Status.FAILED, ambiguity, 0, null);
+                }
+                appium.clickResolved(hit);
+                return new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null);
             }
             case INPUT -> {
                 List<By> locators = locatorsFor(step);
@@ -140,11 +209,17 @@ public class FlowReplayService {
                     return new StepResult(number, type, label, StepResult.Status.FAILED,
                             "No executable locator — the only candidate is index-based", 0, null);
                 }
-                By hit = appium.sendKeysToFirstVisible(locators, step.getInputValue(), STEP_TIMEOUT_SECONDS);
-                return hit != null
-                        ? new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null)
-                        : new StepResult(number, type, label, StepResult.Status.FAILED,
-                                notFoundMessage(locators), 0, null);
+                By hit = appium.findFirstVisible(locators, STEP_TIMEOUT_SECONDS);
+                if (hit == null) {
+                    return new StepResult(number, type, label, StepResult.Status.FAILED,
+                            notFoundMessage(locators), 0, null);
+                }
+                String ambiguity = ambiguityOf(hit);
+                if (ambiguity != null) {
+                    return new StepResult(number, type, label, StepResult.Status.FAILED, ambiguity, 0, null);
+                }
+                appium.typeIntoResolved(hit, step.getInputValue());
+                return new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null);
             }
             case SCROLL_DOWN -> {
                 appium.scrollDown();
@@ -205,6 +280,36 @@ public class FlowReplayService {
                     .forEach(locators::add);
         }
         return locators;
+    }
+
+    /**
+     * Why a step that "found its element" is still not a passing step.
+     *
+     * Finding an element proves only that something matched. When the locator matches many
+     * elements the driver hands back the first one in document order, which for a container-
+     * scoped XPath like //*[@resource-id="…nav_host_fragment"]//android.view.View is an outer
+     * layout, not the card that was tapped during recording. Clicking it throws nothing and
+     * changes nothing, so the step reports PASSED while the app has not moved — observed on a
+     * real flow whose step 3 matched 104 elements and passed in half a second without opening
+     * the card it was named after.
+     *
+     * The generated test would do exactly the same thing, so this is a defect in the step
+     * rather than a quirk of replay, and it is reported as a failure.
+     *
+     * @return null when the locator is unambiguous
+     */
+    private String ambiguityOf(By locator) {
+        int matches;
+        try {
+            matches = appium.countMatches(locator);
+        } catch (RuntimeException e) {
+            log.debug("Could not count matches for {}: {}", locator, e.getMessage());
+            return null;   // never turn a counting problem into a step failure
+        }
+        if (matches <= 1) return null;
+        return "Matched " + matches + " elements, so the click lands on whichever the driver "
+                + "returns first — not necessarily this step's element. Re-point it in the "
+                + "Inspector and pick a locator that matches exactly one. Locator: " + locator;
     }
 
     /** Names every locator that was tried, so a failure says what to go and look at. */

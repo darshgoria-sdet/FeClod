@@ -207,6 +207,24 @@ public class MethodCatalogService {
      * which emits proper SCROLL_DOWN/SCROLL_UP step types and feeds the scroll-then-tap
      * reuse suggestion. Offering them twice would duplicate the existing buttons.
      */
+    /**
+     * The methods that can be dropped between two recorded steps.
+     *
+     * Only waits. Inserting a step does not run it, so the only safe thing to insert is
+     * something whose whole effect is on timing at playback — anything that moves the app
+     * would make the recorded sequence describe a journey the device never took.
+     */
+    public List<ReusableMethod> insertableWaits() {
+        return catalog.stream()
+                .filter(m -> INSERTABLE.contains(m.getKind()))
+                .toList();
+    }
+
+    private static final java.util.Set<ReusableMethod.Kind> INSERTABLE = java.util.EnumSet.of(
+            ReusableMethod.Kind.WAIT_FOR_SECONDS,
+            ReusableMethod.Kind.WAIT_FOR_VISIBILITY,
+            ReusableMethod.Kind.WAIT_FOR_PRESENCE);
+
     public List<ReusableMethod> quickActions() {
         return catalog.stream()
                 .filter(m -> m.isParameterless() || m.isAutoResolvedArgs())

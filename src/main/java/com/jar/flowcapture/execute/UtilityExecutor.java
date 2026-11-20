@@ -89,10 +89,17 @@ public class UtilityExecutor {
             }
             case DRAG_COIN_TO_END -> appium.dragCoinToEnd(by(args, "coinElement"), by(args, "goldBarElement"));
 
-            // --- numeric: nothing to do on the device, the wait only matters at playback ---
-            case WAIT_FOR_SECONDS, IMPLICIT_WAIT -> log.info(
-                    "{} recorded with no device action — it only affects timing in the generated test",
-                    method.getKind());
+            // --- numeric ---
+            // A fixed wait really waits. It is the one step whose entire purpose is elapsed
+            // time, so skipping it during replay would make the replay faster than the test
+            // it is checking — and the reason someone inserts one is that the app needs those
+            // seconds. Logging it and moving on would verify a flow nobody is going to run.
+            case WAIT_FOR_SECONDS -> pause(intArg(args, "seconds", 2));
+            // The implicit wait is driver-wide state, and the studio shares this driver with
+            // its own element lookups and the mirror. Setting it here would quietly change how
+            // every later step behaves, so it is recorded for codegen and not applied live.
+            case IMPLICIT_WAIT -> log.info(
+                    "IMPLICIT_WAIT recorded but not applied — it is driver-wide state the studio also uses");
 
             // --- mixed ---
             case CLICK_AND_VERIFY -> {
@@ -216,6 +223,26 @@ public class UtilityExecutor {
                             + "automatically — pick an element with a resource-id, content-description or text");
         }
         return result;
+    }
+
+    /**
+     * Capped because this runs inside the studio's request thread: a mistyped "600" in the
+     * wait field should not take the dashboard away for ten minutes. The generated test keeps
+     * whatever number was recorded — the cap is on what the tool itself will sit through.
+     */
+    private static final int MAX_PAUSE_SECONDS = 60;
+
+    private void pause(int seconds) {
+        int capped = Math.max(0, Math.min(seconds, MAX_PAUSE_SECONDS));
+        if (capped != seconds) {
+            log.warn("Waiting {}s instead of the recorded {}s — the studio caps its own pauses", capped, seconds);
+        }
+        try {
+            Thread.sleep(capped * 1000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Wait interrupted", e);
+        }
     }
 
     private int intArg(UtilityArgs args, String paramName, int fallback) {

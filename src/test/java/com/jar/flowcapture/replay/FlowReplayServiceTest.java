@@ -39,19 +39,30 @@ class FlowReplayServiceTest {
 
         java.util.List<By> lastLocatorSet = java.util.List.of();
 
+        /** How many elements a given locator "matches" on this fake screen; 1 unless a test says otherwise. */
+        final java.util.Map<String, Integer> matchCounts = new java.util.HashMap<>();
+
         @Override
-        public synchronized By clickFirstVisible(java.util.List<By> locators, int timeoutSeconds) {
+        public synchronized By findFirstVisible(java.util.List<By> locators, int timeoutSeconds) {
             lastLocatorSet = locators;
-            calls.add("click:" + locators.get(0));
             return locators.stream()
                     .filter(by -> failClicksContaining == null || !by.toString().contains(failClicksContaining))
                     .findFirst().orElse(null);
         }
 
         @Override
-        public synchronized By sendKeysToFirstVisible(java.util.List<By> locators, String text, int timeoutSeconds) {
+        public synchronized int countMatches(By by) {
+            return matchCounts.getOrDefault(by.toString(), 1);
+        }
+
+        @Override
+        public synchronized void clickResolved(By by) {
+            calls.add("click:" + by);
+        }
+
+        @Override
+        public synchronized void typeIntoResolved(By by, String text) {
             calls.add("type:" + text);
-            return locators.get(0);
         }
 
         @Override
@@ -257,6 +268,55 @@ class FlowReplayServiceTest {
                 "the alternative that actually matches on the live build must be tried");
     }
 
+    /**
+     * The failure QA hit, and the reason this check exists.
+     *
+     * Step 3 of a real flow was captured on a Compose card whose only locator was the
+     * container-scoped //*[@resource-id="…nav_host_fragment"]//android.view.View — 104
+     * matches. Replay found "an" element, clicked the first of the 104 (an outer layout),
+     * threw nothing, and reported PASSED in half a second while the card never opened.
+     * Finding something is not the same as finding the right thing.
+     */
+    @Test
+    void aTapThroughAnAmbiguousLocatorFailsInsteadOfClickingAnArbitraryElement() {
+        device.matchCounts.put("AppiumBy.id: com.jar:id/one", 104);
+
+        ReplayReport report = service.replay(flowWith(tap("tap the offers card", "com.jar:id/one")), false);
+
+        assertFalse(report.isSuccess());
+        StepResult result = report.getResults().get(0);
+        assertEquals(StepResult.Status.FAILED, result.getStatus());
+        assertTrue(result.getMessage().contains("104 elements"), result.getMessage());
+        assertTrue(device.calls.isEmpty(), "nothing should be clicked once the locator is known to be ambiguous");
+    }
+
+    /** Typing into an ambiguous locator is the same defect: the text can land in another field. */
+    @Test
+    void anInputThroughAnAmbiguousLocatorFailsToo() {
+        RecordedStep input = new RecordedStep();
+        input.setActionType(RecordedStep.ActionType.INPUT);
+        input.setActionLabel("amount field");
+        input.setInputValue("500");
+        input.setCandidateLocators(List.of(new CandidateLocator(
+                CandidateLocator.Strategy.RESOURCE_ID, "com.jar:id/field", "android.widget.EditText")));
+        device.matchCounts.put("AppiumBy.id: com.jar:id/field", 3);
+
+        ReplayReport report = service.replay(flowWith(input), false);
+
+        assertFalse(report.isSuccess());
+        assertTrue(report.getResults().get(0).getMessage().contains("3 elements"));
+        assertTrue(device.calls.isEmpty());
+    }
+
+    /** A locator that resolves to exactly one element is the normal case and must stay fast and quiet. */
+    @Test
+    void aUniqueLocatorStillPassesAndIsActuallyClicked() {
+        ReplayReport report = service.replay(flowWith(tap("tap one", "com.jar:id/one")), false);
+
+        assertTrue(report.isSuccess());
+        assertEquals(List.of("click:AppiumBy.id: com.jar:id/one"), device.calls);
+    }
+
     /** A failure should say what was tried, not name one locator as if it were the only one. */
     @Test
     void aFailureNamesEveryLocatorItTried() {
@@ -267,5 +327,151 @@ class FlowReplayServiceTest {
         String message = report.getResults().get(0).getMessage();
         assertTrue(message.contains("tried"), message);
         assertTrue(message.contains("com.jar:id/one"), message);
+    }
+
+    /**
+     * An inserted wait has to actually wait during replay.
+     *
+     * It was logged and skipped before, on the reasoning that a sleep has no device action —
+     * true, and beside the point. A fixed wait is the one step whose entire purpose is
+     * elapsed time, and it gets inserted precisely because the app needs those seconds. A
+     * replay that skips it runs a faster flow than the test it is supposed to be checking,
+     * and reports a pass the real test will not reproduce.
+     */
+    @Test
+    void aFixedWaitActuallyWaitsDuringReplay() {
+        RecordedStep wait = new RecordedStep();
+        wait.setActionType(RecordedStep.ActionType.UTILITY_CALL);
+        wait.setUtilityMethodKind(ReusableMethod.Kind.WAIT_FOR_SECONDS.name());
+        com.jar.flowcapture.capture.UtilityArgs args = new com.jar.flowcapture.capture.UtilityArgs();
+        args.getScalars().add(new com.jar.flowcapture.capture.UtilityArgs.ScalarArg("seconds", "1"));
+        wait.setUtilityArgs(args);
+
+        long before = System.currentTimeMillis();
+        ReplayReport report = service.replay(flowWith(wait), false);
+        long elapsed = System.currentTimeMillis() - before;
+
+        assertTrue(report.isSuccess(), report.getSummary());
+        assertTrue(elapsed >= 900, "replay should have paused for about a second, took " + elapsed + "ms");
+    }
+
+    /**
+     * An optional screen must not stop the replay.
+     *
+     * The generated test wraps these steps in try/catch and carries on, so a replay that
+     * aborts here is stricter than the code it is checking — and it would stop on exactly
+     * the screen someone has already said is allowed to be missing.
+     */
+    @Test
+    void aFailureInsideACarryOnBlockIsReportedAndSteppedOver() {
+        device.failClicksContaining = "coupon";
+        RecordedFlow flow = flowWith(
+                tap("tap one", "com.jar:id/one"),
+                tap("dismiss coupon sheet", "com.jar:id/coupon"),
+                tap("tap three", "com.jar:id/three"));
+        flow.wrapSteps(1, 1, new com.jar.flowcapture.capture.TryBlock());
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertTrue(report.isSuccess(), report.getSummary());
+        assertEquals(StepResult.Status.FAILED_TOLERATED, report.getResults().get(1).getStatus());
+        assertEquals(1, report.getTolerated());
+        assertEquals(2, report.getPassed());
+        assertEquals(0, report.getNotReached(), "the steps after an optional one must still run");
+        assertTrue(report.getSummary().contains("optional step"), report.getSummary());
+    }
+
+    /** A block that says to fail still fails, and still stops the replay. */
+    @Test
+    void aFailureInsideAFailWithMessageBlockStillAborts() {
+        device.failClicksContaining = "pay";
+        RecordedFlow flow = flowWith(tap("pay", "com.jar:id/pay"), tap("after", "com.jar:id/after"));
+        var block = new com.jar.flowcapture.capture.TryBlock();
+        block.setOnFailure(com.jar.flowcapture.capture.TryBlock.OnFailure.FAIL_WITH_MESSAGE);
+        flow.wrapSteps(0, 0, block);
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertFalse(report.isSuccess());
+        assertEquals(StepResult.Status.FAILED, report.getResults().get(0).getStatus());
+        assertEquals(1, report.getNotReached());
+    }
+
+    /** A step wrapped in a carry-on block that works is an ordinary pass, not a tolerated one. */
+    @Test
+    void aWrappedStepThatSucceedsIsJustAPass() {
+        RecordedFlow flow = flowWith(tap("dismiss coupon sheet", "com.jar:id/coupon"));
+        flow.wrapSteps(0, 0, new com.jar.flowcapture.capture.TryBlock());
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertEquals(StepResult.Status.PASSED, report.getResults().get(0).getStatus());
+        assertEquals(0, report.getTolerated());
+    }
+
+    /**
+     * The backup route, which is how this team already uses try/catch by hand: if the first
+     * way through a screen does not work, take the other way. The backup has to run at the
+     * moment the try failed — in the state the failure left behind — or the replay is not
+     * checking the same program the generated catch block describes.
+     */
+    @Test
+    void whenATryFailsItsBackupStepsRunInItsPlace() {
+        device.failClicksContaining = "primary";
+        RecordedFlow flow = flowWith(
+                tap("primary way", "com.jar:id/primary"),
+                tap("other way", "com.jar:id/fallback"),
+                tap("carry on", "com.jar:id/next"));
+        var block = new com.jar.flowcapture.capture.TryBlock();
+        block.setOnFailure(com.jar.flowcapture.capture.TryBlock.OnFailure.RUN_RECOVERY_STEPS);
+        flow.wrapSteps(0, 0, block);
+        flow.assignToCatch(1, 1, block.getId());
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertTrue(report.isSuccess(), report.getSummary());
+        assertTrue(device.calls.contains("click:AppiumBy.id: com.jar:id/fallback"),
+                "the backup step should have run: " + device.calls);
+        assertTrue(device.calls.contains("click:AppiumBy.id: com.jar:id/next"),
+                "and the flow should carry on afterwards: " + device.calls);
+    }
+
+    /** When the try works, the backup must not run — it is a fallback, not an extra step. */
+    @Test
+    void backupStepsStayPutWhenTheTrySucceeds() {
+        RecordedFlow flow = flowWith(
+                tap("primary way", "com.jar:id/primary"),
+                tap("other way", "com.jar:id/fallback"));
+        var block = new com.jar.flowcapture.capture.TryBlock();
+        block.setOnFailure(com.jar.flowcapture.capture.TryBlock.OnFailure.RUN_RECOVERY_STEPS);
+        flow.wrapSteps(0, 0, block);
+        flow.assignToCatch(1, 1, block.getId());
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertTrue(report.isSuccess(), report.getSummary());
+        assertFalse(device.calls.contains("click:AppiumBy.id: com.jar:id/fallback"),
+                "the backup must not run when the try worked: " + device.calls);
+        assertEquals(StepResult.Status.SKIPPED, report.getResults().get(1).getStatus());
+    }
+
+    /** The catch was the second attempt. If the backup fails too, there is no third. */
+    @Test
+    void aBackupStepThatAlsoFailsStopsTheReplay() {
+        device.failClicksContaining = "com.jar";
+        RecordedFlow flow = flowWith(
+                tap("primary way", "com.jar:id/primary"),
+                tap("other way", "com.jar:id/fallback"),
+                tap("carry on", "com.jar:id/next"));
+        var block = new com.jar.flowcapture.capture.TryBlock();
+        block.setOnFailure(com.jar.flowcapture.capture.TryBlock.OnFailure.RUN_RECOVERY_STEPS);
+        flow.wrapSteps(0, 0, block);
+        flow.assignToCatch(1, 1, block.getId());
+
+        ReplayReport report = service.replay(flow, false);
+
+        assertFalse(report.isSuccess());
+        assertFalse(device.calls.contains("click:AppiumBy.id: com.jar:id/next"),
+                "nothing after the failed backup should run: " + device.calls);
     }
 }

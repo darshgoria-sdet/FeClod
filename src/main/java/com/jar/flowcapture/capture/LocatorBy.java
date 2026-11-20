@@ -23,7 +23,7 @@ public final class LocatorBy {
         return switch (locator.getStrategy()) {
             case RESOURCE_ID -> resourceIdBy(locator.getValue());
             case CONTENT_DESC -> AppiumBy.accessibilityId(locator.getValue());
-            case EXACT_TEXT_XPATH, CLASS_NAME_XPATH -> By.xpath(locator.getValue());
+            case EXACT_TEXT_XPATH, CLASS_NAME_XPATH, INDEXED_UNDER_ANCHOR -> By.xpath(locator.getValue());
             case TEXT_CONTAINS_UIAUTOMATOR -> AppiumBy.androidUIAutomator(locator.getValue());
             case INDEX_BASED -> null;
         };

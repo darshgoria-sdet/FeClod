@@ -17,6 +17,8 @@ const state = {
     // image's own size would halve every tap coordinate.
     deviceWidth: 0,
     deviceHeight: 0,
+    // The flow's try/catch blocks, so a step row can show the block it belongs to.
+    tryBlocks: [],
     // Hand edits per file, keyed by tab. A file with an entry here is no longer refreshed
     // from the generator — otherwise the next recorded step would silently discard the edit.
     edits: {},
@@ -63,6 +65,9 @@ const actionsEmpty = el('actionsEmpty');
 const actionCount = el('actionCount');
 const stepCount = el('stepCount');
 const stepsEmpty = el('stepsEmpty');
+// Declared up here, not with the other insert-modal refs at the foot of the file:
+// updateStepCount() touches it during init, before those would have initialised.
+const appendWaitBtn = el('appendWaitBtn');
 const pickOverlay = el('pickOverlay');
 const pickOverlayText = el('pickOverlayText');
 const paneTabs = document.querySelectorAll('.pane-tab');
@@ -211,7 +216,7 @@ resumeBtn.addEventListener('click', guarded(async () => {
     resumeBanner.classList.add('hidden');
     enterRecordingUi(current.flowName);
     assertionsToggle.checked = current.generateAssertions !== false;
-    renderSteps(current.steps);
+    renderSteps(current);
     await refreshPreview();
 }));
 
@@ -647,7 +652,8 @@ targetAreaSelect.addEventListener('change', guarded(async () => {
  * test waiting to be committed.
  * ------------------------------------------------------------------------- */
 
-const STATUS_MARK = { PASSED: '\u2713', FAILED: '\u2717', SKIPPED: '\u2013', NOT_REACHED: '\u00b7' };
+const STATUS_MARK = { PASSED: '\u2713', FAILED: '\u2717', FAILED_TOLERATED: '!',
+    SKIPPED: '\u2013', NOT_REACHED: '\u00b7' };
 
 replayBtn.addEventListener('click', () => {
     if (!state.recording) return;
@@ -869,6 +875,18 @@ function buildElementPicker(param) {
             pickOverlay.classList.remove('hidden');
         });
         box.appendChild(tapBtn);
+
+        // The same choice, made deliberately: the tree shows every attribute and every
+        // candidate's match count, which is what you need when the obvious locator is the
+        // one that keeps breaking.
+        const inspectBtn = document.createElement('button');
+        inspectBtn.textContent = 'Pick in inspector';
+        inspectBtn.addEventListener('click', guarded(async () => {
+            paramModal.classList.add('hidden');
+            await openInspectorFor({ type: 'param', param, chosenEl: chosen },
+                'Choosing a locator for: ' + param.prompt);
+        }));
+        box.appendChild(inspectBtn);
     }
     box.appendChild(chosen);
     return box;
@@ -983,17 +1001,18 @@ reuseDeclineBtn.addEventListener('click', () => {
 // rendered image may be letterboxed. We need the actual device resolution to scale a
 // click correctly; fetched once per connection via the img's naturalWidth/Height, which
 // reflect the real screenshot pixel dimensions since no CSS scaling touches them.
-screenImg.addEventListener('click', guarded(async (ev) => {
-    if (!state.connected || !state.recording) return;
-
+/**
+ * Where the mirrored frame is actually drawn inside its box, and what one of its pixels is
+ * worth in device pixels. Shared by click mapping and by the inspector's highlight box, so a
+ * tap and the rectangle drawn around the element it hits can never disagree.
+ */
+function imageGeometry() {
     const rect = screenImg.getBoundingClientRect();
     // Aspect ratio comes from the rendered frame (it is correct whatever the scale), but the
     // coordinates themselves are scaled to the REAL device resolution reported by the server.
     const naturalW = screenImg.naturalWidth;
     const naturalH = screenImg.naturalHeight;
-    if (!naturalW || !naturalH) return;
-    const deviceW = state.deviceWidth || naturalW;
-    const deviceH = state.deviceHeight || naturalH;
+    if (!naturalW || !naturalH) return null;
 
     const renderedAspect = rect.width / rect.height;
     const naturalAspect = naturalW / naturalH;
@@ -1010,6 +1029,19 @@ screenImg.addEventListener('click', guarded(async (ev) => {
         offsetY = 0;
         offsetX = (rect.width - drawnWidth) / 2;
     }
+    return {
+        rect, drawnWidth, drawnHeight, offsetX, offsetY,
+        deviceW: state.deviceWidth || naturalW,
+        deviceH: state.deviceHeight || naturalH,
+    };
+}
+
+screenImg.addEventListener('click', guarded(async (ev) => {
+    if (!state.connected) return;
+
+    const geo = imageGeometry();
+    if (!geo) return;
+    const { rect, drawnWidth, drawnHeight, offsetX, offsetY, deviceW, deviceH } = geo;
 
     const clickXInImage = ev.clientX - rect.left - offsetX;
     const clickYInImage = ev.clientY - rect.top - offsetY;
@@ -1019,6 +1051,16 @@ screenImg.addEventListener('click', guarded(async (ev) => {
 
     const deviceX = Math.round((clickXInImage / drawnWidth) * deviceW);
     const deviceY = Math.round((clickYInImage / drawnHeight) * deviceH);
+
+    // The inspector is a read-only view of the phone. A click there selects the element under
+    // the finger and nothing else: it must not drive the device, because the screen being
+    // inspected is the screen the answer is on.
+    if (inspectorIsOpen() && !pendingParam) {
+        await captureTree(deviceX, deviceY);
+        return;
+    }
+
+    if (!state.recording) return;
 
     // When a parameterised action is waiting for an element, this tap only identifies that
     // element — it must NOT become a step of its own, and must not drive the device, or the
@@ -1079,6 +1121,7 @@ labelConfirmBtn.addEventListener('click', guarded(async () => {
         }
         maybeShowSuggestion(resp.suggestedExistingMethod);
         maybeShowReuse(resp.existingLocator);
+        maybeWarnAboutLocator(resp.locatorWarning);
         applyPreview(resp.preview);
     } finally {
         state.pendingClick = null;
@@ -1139,6 +1182,31 @@ function addStepToLog(step, text) {
     const li = document.createElement('li');
     li.className = 'step-item';
 
+    // Dragging reorders the flow. The handle is explicit rather than making the whole row
+    // draggable, because the row also carries four buttons and a text selection people use.
+    li.draggable = false;
+    const grip = document.createElement('span');
+    grip.className = 'step-grip';
+    grip.textContent = '\u2630';
+    grip.title = 'Drag to move this step';
+    grip.addEventListener('mousedown', () => { li.draggable = true; });
+    grip.addEventListener('mouseup', () => { li.draggable = false; });
+    li.appendChild(grip);
+    attachDragHandlers(li);
+
+    // "Insert before this step". It lives inside the row rather than as a divider between
+    // rows because deleting a step finds its position with indexOf on this list's children —
+    // a divider element would silently shift every index by one.
+    const insertBefore = document.createElement('button');
+    insertBefore.className = 'step-insert';
+    insertBefore.textContent = '+';
+    insertBefore.title = 'Insert a wait before this step';
+    insertBefore.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        openInsertModal([...stepsList.children].indexOf(li));
+    });
+    li.appendChild(insertBefore);
+
     const index = document.createElement('span');
     index.className = 'step-index';
     index.textContent = String(stepsList.children.length + 1);
@@ -1156,6 +1224,65 @@ function addStepToLog(step, text) {
     span.textContent = text;
     li.appendChild(span);
 
+    // Derived from the step's own data rather than from the response that created it, so the
+    // mark survives every re-render — deleting another step must not quietly un-flag this one.
+    const risk = locatorRisk(step);
+    if (risk) {
+        li.classList.add('step-risky');
+        const mark = document.createElement('span');
+        mark.className = 'step-warn';
+        mark.textContent = '\u26a0';
+        mark.title = risk;
+        li.appendChild(mark);
+    }
+
+    // Only steps that own an element can be re-pointed. A scroll or a Back press has no
+    // locator of its own, so offering the button there would be a dead end.
+    if (step && step.candidateLocators && step.candidateLocators.length) {
+        const relocate = document.createElement('button');
+        relocate.className = 'step-locator';
+        relocate.textContent = 'locator';
+        relocate.title = 'Pick a different locator for this element';
+        relocate.addEventListener('click', guarded(async () => {
+            const index = [...stepsList.children].indexOf(li);
+            await retargetStep(index, text);
+        }));
+        li.appendChild(relocate);
+    }
+
+    if (step && step.catchGroup) {
+        li.classList.add('step-backup');
+        li.title = 'A backup step — runs only if its try block fails';
+    }
+
+    const block = blockFor(step);
+    if (block) {
+        li.classList.add('step-wrapped');
+        const tryBtn = document.createElement('button');
+        tryBtn.className = 'step-try';
+        tryBtn.textContent = 'try';
+        tryBtn.title = block.onFailure === 'CONTINUE'
+            ? 'In a try/catch that logs and carries on — click to remove the wrapper'
+            : 'In a try/catch that fails with your message — click to remove the wrapper';
+        tryBtn.addEventListener('click', guarded(async () => {
+            const resp = await api('/api/flow/try-block/' + block.id, 'DELETE');
+            const current = await api('/api/flow/current');
+            renderSteps(current);
+            applyPreview(resp.preview);
+        }));
+        li.appendChild(tryBtn);
+    } else {
+        const tryBtn = document.createElement('button');
+        tryBtn.className = 'step-try';
+        tryBtn.textContent = 'try';
+        tryBtn.title = 'Wrap this step (and optionally the ones after it) in try/catch';
+        tryBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            openTryModal([...stepsList.children].indexOf(li));
+        });
+        li.appendChild(tryBtn);
+    }
+
     const remove = document.createElement('button');
     remove.className = 'step-remove';
     remove.textContent = '\u00d7';
@@ -1172,9 +1299,38 @@ function addStepToLog(step, text) {
     updateStepCount();
 }
 
+/**
+ * Whether this step's element can be found again reliably.
+ *
+ * A locator that matches many elements resolves to whichever the driver returns first, which
+ * is how a tap can "succeed" without touching the thing it was named after. A step reusing a
+ * repo locator is not flagged: that declaration is what the generated test will use, and it
+ * is the repo's call, not this tool's.
+ */
+function locatorRisk(step) {
+    if (!step || step.reusedLocator) return null;
+    const candidates = step.candidateLocators || [];
+    if (!candidates.length) return null;
+    const best = candidates.find(c => c.strategy !== 'INDEX_BASED');
+    if (!best) {
+        return 'No usable locator — only an index placeholder. Press "locator" to pick one in the Inspector.';
+    }
+    if (best.matchCount > 1) {
+        return `This element's locator matches ${best.matchCount} elements on the screen it was `
+            + 'captured from, so a click can land on the wrong one. Press "locator" to pick a unique one.';
+    }
+    return null;
+}
+
+/** Said once, loudly, at the moment of capture — the screen is still there to fix it on. */
+function maybeWarnAboutLocator(warning) {
+    if (warning) showWarning(warning);
+}
+
 function updateStepCount() {
     const n = stepsList.children.length;
     stepCount.textContent = String(n);
+    appendWaitBtn.classList.toggle('hidden', n === 0);
     stepsEmpty.classList.toggle('hidden', n > 0 || !state.recording === false && n > 0);
     stepsEmpty.classList.toggle('hidden', n > 0);
 }
@@ -1208,11 +1364,18 @@ async function deleteStep(index, total) {
     }
     const resp = await api('/api/flow/step/' + index, 'DELETE');
     const current = await api('/api/flow/current');
-    renderSteps(current.steps);
+    renderSteps(current);
     applyPreview(resp.preview);
 }
 
-function renderSteps(steps) {
+/**
+ * @param flow the whole flow, so the step rows can show which try/catch block each step is
+ *             in. Passing only the steps would leave the rows unable to say anything about
+ *             blocks, and a wrapped step that looks unwrapped is a misleading step list.
+ */
+function renderSteps(flow) {
+    const steps = Array.isArray(flow) ? flow : (flow.steps || []);
+    state.tryBlocks = Array.isArray(flow) ? state.tryBlocks : (flow.tryBlocks || []);
     stepsList.innerHTML = '';
     updateStepCount();
     steps.forEach(step => {
@@ -1275,4 +1438,759 @@ async function refreshPreview() {
     } catch (e) {
         // no active flow yet — fine, preview stays at its placeholder text
     }
+}
+
+// --- Inspector -------------------------------------------------------------
+//
+// A read-only view of the device's element tree, with every attribute and — the part the
+// ranker cannot decide for you — how many elements each candidate locator actually matches
+// on this screen. The generator's first choice is a guess about which attribute survives the
+// next release; this is where the person who knows the app overrules it.
+
+const inspectorPane = el('inspectorPane');
+const inspectRefreshBtn = el('inspectRefreshBtn');
+const inspectSearch = el('inspectSearch');
+const inspectRawBtn = el('inspectRawBtn');
+const inspectTarget = el('inspectTarget');
+const inspectTree = el('inspectTree');
+const inspectDetail = el('inspectDetail');
+const highlightBox = el('highlightBox');
+const benchStrategy = el('benchStrategy');
+const benchValue = el('benchValue');
+const benchRunBtn = el('benchRunBtn');
+const benchResult = el('benchResult');
+const rawModal = el('rawModal');
+const rawXml = el('rawXml');
+const rawCloseBtn = el('rawCloseBtn');
+
+const inspect = {
+    nodes: new Map(),   // id -> node
+    selectedId: null,
+    collapsed: new Set(),
+    // What a chosen locator should be applied to: a step being re-pointed, or an element
+    // argument a parameterised method is waiting for. Null means "just looking".
+    target: null,
+};
+
+function inspectorIsOpen() {
+    return !inspectorPane.classList.contains('hidden');
+}
+
+async function openInspectorFor(target, message) {
+    inspect.target = target;
+    inspectTarget.textContent = message;
+    inspectTarget.classList.remove('hidden');
+    showPane('inspectorPane');
+    await captureTree();
+}
+
+/** Opens the inspector aimed at one recorded step, so picking a locator re-points that step. */
+async function retargetStep(index, label) {
+    await openInspectorFor({ type: 'step', index },
+        `Choosing a locator for step ${index + 1} — ${label}`);
+}
+
+function clearInspectorTarget() {
+    inspect.target = null;
+    inspectTarget.classList.add('hidden');
+    inspectTarget.textContent = '';
+}
+
+async function captureTree(x, y) {
+    if (!state.connected) { showError('Connect the device first'); return; }
+    const query = (x === undefined || y === undefined) ? '' : `?x=${x}&y=${y}`;
+    const tree = await api('/api/flow/inspect/tree' + query);
+    inspect.nodes.clear();
+    indexNode(tree.root);
+    inspect.selectedId = tree.selectedId !== null && tree.selectedId !== undefined
+        ? tree.selectedId
+        : (inspect.nodes.has(inspect.selectedId) ? inspect.selectedId : null);
+    renderTree();
+    if (inspect.selectedId !== null) selectNode(inspect.selectedId, { scroll: true });
+    if (!tree.candidatesComputed) {
+        showWarning(`This screen has ${tree.nodeCount} elements — too many to pre-count locators for `
+            + 'every one. Use the locator bench at the bottom to test a selector instead.');
+    }
+}
+
+function indexNode(node) {
+    inspect.nodes.set(node.id, node);
+    node.children.forEach(indexNode);
+}
+
+function renderTree() {
+    const filter = inspectSearch.value.trim().toLowerCase();
+    inspectTree.innerHTML = '';
+    const root = inspect.nodes.get(0);
+    if (!root) {
+        inspectTree.innerHTML = '<p class="empty-note">Press "Capture screen" to read the phone\'s element tree.</p>';
+        return;
+    }
+    if (filter) {
+        // A filtered tree is a list of hits, not a shape: hiding non-matching parents while
+        // keeping the indentation would be a tree with holes in it, which reads worse than
+        // the flat answer to "where is the thing I typed".
+        [...inspect.nodes.values()]
+            .filter(node => matchesFilter(node, filter))
+            .slice(0, 300)
+            .forEach(node => inspectTree.appendChild(treeRow(node, true)));
+        if (!inspectTree.children.length) {
+            inspectTree.innerHTML = '<p class="empty-note">Nothing on this screen matches that.</p>';
+        }
+        return;
+    }
+    appendRows(root);
+}
+
+function appendRows(node) {
+    inspectTree.appendChild(treeRow(node, false));
+    if (inspect.collapsed.has(node.id)) return;
+    node.children.forEach(appendRows);
+}
+
+function matchesFilter(node, filter) {
+    return [node.resourceId, node.contentDesc, node.text, node.className]
+        .some(v => (v || '').toLowerCase().includes(filter));
+}
+
+function treeRow(node, flat) {
+    const row = document.createElement('div');
+    row.className = 'tree-row';
+    if (node.id === inspect.selectedId) row.classList.add('selected');
+    row.style.paddingLeft = (flat ? 6 : 6 + node.depth * 11) + 'px';
+
+    const caret = document.createElement('span');
+    caret.className = 'tree-caret';
+    caret.textContent = node.children.length ? (inspect.collapsed.has(node.id) ? '▸' : '▾') : '';
+    if (node.children.length && !flat) {
+        caret.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (inspect.collapsed.has(node.id)) inspect.collapsed.delete(node.id);
+            else inspect.collapsed.add(node.id);
+            renderTree();
+        });
+    }
+    row.appendChild(caret);
+
+    row.appendChild(span('tree-tag', shortClass(node.className || node.tag)));
+    if (node.resourceId) row.appendChild(span('tree-id', '#' + shortId(node.resourceId)));
+    const label = node.text || node.contentDesc;
+    if (label) row.appendChild(span('tree-text', '"' + truncate(label, 28) + '"'));
+    if (!node.resourceId && !label && node.children.length) {
+        row.appendChild(span('tree-count', '(' + node.children.length + ')'));
+    }
+
+    row.addEventListener('click', () => selectNode(node.id));
+    return row;
+}
+
+function span(className, text) {
+    const s = document.createElement('span');
+    s.className = className;
+    s.textContent = text;
+    return s;
+}
+
+/** "android.widget.TextView" reads as "TextView" here; the full value is in the attribute table. */
+function shortClass(value) {
+    if (!value) return '?';
+    const cut = value.lastIndexOf('.');
+    return cut >= 0 ? value.slice(cut + 1) : value;
+}
+
+/** Drops the "com.app.pkg:id/" prefix so the part that identifies the element is what you read. */
+function shortId(value) {
+    const cut = value.indexOf(':id/');
+    return cut >= 0 ? value.slice(cut + 4) : value;
+}
+
+function truncate(value, max) {
+    return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+function selectNode(id, options = {}) {
+    inspect.selectedId = id;
+    [...inspectTree.children].forEach(row => row.classList.remove('selected'));
+    renderTree();
+    if (options.scroll) {
+        const selected = inspectTree.querySelector('.tree-row.selected');
+        if (selected) selected.scrollIntoView({ block: 'center' });
+    }
+    const node = inspect.nodes.get(id);
+    renderDetail(node);
+    drawHighlight(node);
+}
+
+function renderDetail(node) {
+    inspectDetail.innerHTML = '';
+    if (!node) { inspectDetail.classList.add('hidden'); return; }
+    inspectDetail.classList.remove('hidden');
+
+    const title = document.createElement('p');
+    title.className = 'detail-title';
+    title.textContent = shortClass(node.className || node.tag)
+        + (node.resourceId ? ' · ' + shortId(node.resourceId) : '');
+    inspectDetail.appendChild(title);
+
+    const attrs = document.createElement('div');
+    attrs.className = 'attr-table';
+    Object.entries(node.attributes)
+        .filter(([, value]) => value !== '' && value !== 'false')
+        .forEach(([name, value]) => {
+            attrs.appendChild(span('attr-name', name));
+            attrs.appendChild(span('attr-value', value));
+        });
+    attrs.appendChild(span('attr-name', 'xpath'));
+    attrs.appendChild(span('attr-value', node.xpath));
+    inspectDetail.appendChild(attrs);
+
+    const list = document.createElement('div');
+    list.className = 'cand-list';
+    const candidates = [...(node.candidates || [])];
+    // The absolute path always works right now and almost never survives a release, so it is
+    // offered last and labelled for what it is rather than left out — sometimes it is the
+    // only thing that identifies an unlabelled Compose node.
+    candidates.push({
+        strategy: 'EXACT_TEXT_XPATH', value: node.xpath,
+        elementClass: node.className, matchCount: 1, absolutePath: true,
+    });
+    candidates.forEach(candidate => list.appendChild(candidateRow(candidate)));
+    inspectDetail.appendChild(list);
+}
+
+function candidateRow(candidate) {
+    const row = document.createElement('div');
+    row.className = 'cand-row';
+    const placeholder = candidate.strategy === 'INDEX_BASED';
+    if (!placeholder && candidate.matchCount === 1) row.classList.add('unique');
+    if (candidate.matchCount > 1) row.classList.add('ambiguous');
+
+    const body = document.createElement('div');
+    body.className = 'cand-body';
+    body.appendChild(span('cand-value', candidate.value));
+    body.appendChild(span('cand-meta ' + metaClass(candidate), candidateMeta(candidate)));
+    row.appendChild(body);
+
+    const actions = document.createElement('div');
+    actions.className = 'cand-actions';
+
+    const testBtn = document.createElement('button');
+    testBtn.textContent = 'Test';
+    testBtn.title = 'Run this locator against the device right now';
+    testBtn.addEventListener('click', guarded(async () => {
+        benchStrategy.value = candidate.strategy;
+        benchValue.value = candidate.value;
+        await runBench();
+    }));
+    actions.appendChild(testBtn);
+
+    const useBtn = document.createElement('button');
+    useBtn.className = 'primary';
+    useBtn.textContent = 'Use';
+    useBtn.disabled = placeholder;
+    useBtn.title = placeholder
+        ? 'Fill in the instance index first'
+        : 'Use this locator for the step or argument being chosen';
+    useBtn.addEventListener('click', guarded(() => applyLocator(candidate)));
+    actions.appendChild(useBtn);
+
+    row.appendChild(actions);
+    return row;
+}
+
+function metaClass(candidate) {
+    if (candidate.strategy === 'INDEX_BASED') return 'bad';
+    if (candidate.absolutePath) return 'bad';
+    if (candidate.matchCount === 1) return 'good';
+    return 'bad';
+}
+
+function candidateMeta(candidate) {
+    const strategy = candidate.strategy.toLowerCase().replace(/_/g, ' ');
+    if (candidate.absolutePath) return strategy + ' · absolute path, breaks on any layout change';
+    if (candidate.strategy === 'INDEX_BASED') return strategy + ' · needs an instance number, brittle';
+    if (candidate.matchCount === 1) return strategy + ' · matches exactly 1 element';
+    if (candidate.matchCount === 0) return strategy + ' · matches nothing on this screen';
+    return strategy + ' · matches ' + candidate.matchCount + ' elements — resolves to an arbitrary one';
+}
+
+/**
+ * Applies the chosen locator wherever the inspector was opened from. With no target it goes
+ * into the bench instead of being silently dropped — the user still wanted that string.
+ */
+async function applyLocator(candidate) {
+    const chosen = {
+        strategy: candidate.strategy,
+        value: candidate.value,
+        elementClass: candidate.elementClass || null,
+        matchCount: candidate.matchCount || 0,
+    };
+    const target = inspect.target;
+
+    if (target && target.type === 'step') {
+        const resp = await api(`/api/flow/step/${target.index}/locator`, 'POST', chosen);
+        const current = await api('/api/flow/current');
+        renderSteps(current);
+        applyPreview(resp.preview);
+        clearInspectorTarget();
+        showPane('stepsPane');
+        maybeShowReuse(resp.existingLocator);
+        maybeWarnAboutLocator(resp.locatorWarning);
+        return;
+    }
+
+    if (target && target.type === 'param') {
+        const label = window.prompt('Name this element (e.g. proceed CTA):');
+        if (!label) return;
+        const resolved = await api('/api/flow/adopt-locator', 'POST', chosen);
+        addElement(target.param, resolved, label, target.chosenEl);
+        clearInspectorTarget();
+        paramModal.classList.remove('hidden');
+        return;
+    }
+
+    benchStrategy.value = chosen.strategy;
+    benchValue.value = chosen.value;
+    await runBench();
+}
+
+function drawHighlight(node) {
+    const geo = imageGeometry();
+    if (!node || !node.rect || !geo) { highlightBox.classList.add('hidden'); return; }
+    const [left, top, right, bottom] = node.rect;
+    const scaleX = geo.drawnWidth / geo.deviceW;
+    const scaleY = geo.drawnHeight / geo.deviceH;
+    highlightBox.style.left = (geo.offsetX + left * scaleX) + 'px';
+    highlightBox.style.top = (geo.offsetY + top * scaleY) + 'px';
+    highlightBox.style.width = Math.max(2, (right - left) * scaleX) + 'px';
+    highlightBox.style.height = Math.max(2, (bottom - top) * scaleY) + 'px';
+    highlightBox.classList.remove('hidden');
+}
+
+async function runBench() {
+    const value = benchValue.value.trim();
+    if (!value) { showError('Type a locator to test'); return; }
+    benchResult.className = 'bench-result';
+    benchResult.textContent = 'Testing on the device…';
+    const result = await api('/api/flow/inspect/test-locator', 'POST',
+        { strategy: benchStrategy.value, value, elementClass: null, matchCount: 0 });
+    benchResult.className = 'bench-result ' + (result.matchCount === 1 ? 'good' : 'bad');
+    benchResult.textContent = `${result.verdict} · ${result.elapsedMs} ms · ${result.resolvedAs}`;
+}
+
+inspectRefreshBtn.addEventListener('click', guarded(() => captureTree()));
+inspectSearch.addEventListener('input', () => renderTree());
+benchRunBtn.addEventListener('click', guarded(runBench));
+benchValue.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') benchRunBtn.click(); });
+
+inspectRawBtn.addEventListener('click', guarded(async () => {
+    const resp = await api('/api/flow/inspect/source');
+    rawXml.value = resp.xml;
+    rawModal.classList.remove('hidden');
+}));
+rawCloseBtn.addEventListener('click', () => rawModal.classList.add('hidden'));
+
+// The highlight is drawn in rendered-image pixels, so it has to be redrawn whenever the
+// mirror changes size — otherwise it keeps pointing at where the element used to be.
+window.addEventListener('resize', () => {
+    if (inspect.selectedId !== null) drawHighlight(inspect.nodes.get(inspect.selectedId));
+});
+
+paneTabs.forEach(tab => {
+    tab.addEventListener('click', async () => {
+        if (tab.dataset.pane === 'inspectorPane') {
+            if (!inspect.nodes.size && state.connected) await captureTree();
+        } else {
+            highlightBox.classList.add('hidden');
+        }
+    });
+});
+
+// --- Inserting a wait between steps ----------------------------------------
+//
+// Recording can only append, because it follows a person using a phone. Editing is the other
+// half: the commonest repair after a replay is "this screen needs a moment", and that belongs
+// between two steps that already exist. Nothing runs on the device when a step is inserted —
+// the phone is not on that screen — so Replay is what says whether the wait actually helped.
+
+const insertModal = el('insertModal');
+const insertModalTitle = el('insertModalTitle');
+const insertKind = el('insertKind');
+const insertSecondsField = el('insertSecondsField');
+const insertSeconds = el('insertSeconds');
+const insertElementField = el('insertElementField');
+const insertElementKind = el('insertElementKind');
+const insertElementValue = el('insertElementValue');
+const insertConfirmBtn = el('insertConfirmBtn');
+const insertCancelBtn = el('insertCancelBtn');
+
+let insertAt = null;
+
+function openInsertModal(at) {
+    if (!state.recording) { showError('Start or resume a recording first'); return; }
+    insertAt = at;
+    insertModalTitle.textContent = at >= stepsList.children.length
+        ? 'Add a wait at the end'
+        : `Insert a wait before step ${at + 1}`;
+    insertElementValue.value = '';
+    syncInsertFields();
+    insertModal.classList.remove('hidden');
+    insertElementValue.focus();
+}
+
+function syncTryFields() {
+    const backup = tryOnFailure.value === 'RUN_RECOVERY_STEPS';
+    tryCatchRange.classList.toggle('hidden', !backup);
+}
+
+function syncInsertFields() {
+    const fixed = insertKind.value === 'WAIT_FOR_SECONDS';
+    insertSecondsField.classList.toggle('hidden', !fixed);
+    insertElementField.classList.toggle('hidden', fixed);
+}
+
+insertKind.addEventListener('change', syncInsertFields);
+insertCancelBtn.addEventListener('click', () => {
+    insertModal.classList.add('hidden');
+    insertAt = null;
+});
+appendWaitBtn.addEventListener('click', () => openInsertModal(stepsList.children.length));
+
+insertConfirmBtn.addEventListener('click', guarded(async () => {
+    const kind = insertKind.value;
+    const args = { elements: [], scalars: [] };
+
+    if (kind === 'WAIT_FOR_SECONDS') {
+        const seconds = parseInt(insertSeconds.value, 10);
+        if (!seconds || seconds < 1) { showError('Enter how many seconds to wait'); return; }
+        args.scalars.push({ paramName: 'seconds', value: String(seconds) });
+    } else {
+        const described = insertElementValue.value.trim();
+        if (!described) { showError('Describe the element to wait for'); return; }
+        // The same resolver the off-screen element picker uses: the element cannot be tapped
+        // on the mirror, because the screen it belongs to is not the one in front of us.
+        const resolved = await api('/api/flow/describe-element', 'POST',
+            { kind: insertElementKind.value, value: described });
+        args.elements.push({
+            paramName: 'element',
+            fieldName: toFieldName(described),
+            candidateLocators: resolved.candidates,
+            reusedFrom: resolved.existingLocator || null,
+        });
+    }
+
+    const resp = await api('/api/flow/step/insert', 'POST',
+        { at: insertAt, methodKind: kind, args });
+    insertModal.classList.add('hidden');
+    insertAt = null;
+
+    const current = await api('/api/flow/current');
+    renderSteps(current);
+    applyPreview(resp.preview);
+}));
+
+// --- Past flows ------------------------------------------------------------
+//
+// Finishing used to be the end of a recording: the Java landed in the repo and the steps
+// that produced it were dropped, so changing one step later meant walking the whole journey
+// on the phone again. A finished flow is now kept, and re-opening it puts the steps back in
+// front of you — edit, insert a wait, regenerate.
+
+const openLibraryBtn = el('openLibraryBtn');
+const libraryModal = el('libraryModal');
+const libraryList = el('libraryList');
+const libraryEmpty = el('libraryEmpty');
+const libraryCloseBtn = el('libraryCloseBtn');
+
+openLibraryBtn.addEventListener('click', guarded(async () => {
+    const flows = await api('/api/flow/library');
+    libraryList.innerHTML = '';
+    libraryEmpty.classList.toggle('hidden', flows.length > 0);
+    flows.forEach(flow => libraryList.appendChild(libraryRow(flow)));
+    libraryModal.classList.remove('hidden');
+}));
+
+libraryCloseBtn.addEventListener('click', () => libraryModal.classList.add('hidden'));
+
+function libraryRow(summary) {
+    const row = document.createElement('div');
+    row.className = 'library-row';
+
+    const body = document.createElement('div');
+    body.className = 'library-body';
+    const name = document.createElement('span');
+    name.className = 'library-name';
+    name.textContent = summary.flowName;
+    body.appendChild(name);
+    const meta = document.createElement('span');
+    meta.className = 'library-meta';
+    meta.textContent = `${summary.stepCount} step${summary.stepCount === 1 ? '' : 's'}`
+        + ` · ${summary.targetArea} · ${whenText(summary.finishedAt)}`;
+    body.appendChild(meta);
+    row.appendChild(body);
+
+    const open = document.createElement('button');
+    open.className = 'primary';
+    open.textContent = 'Open';
+    open.addEventListener('click', guarded(() => openSavedFlow(summary)));
+    row.appendChild(open);
+
+    const forget = document.createElement('button');
+    forget.textContent = 'Forget';
+    // Says what it does, because the obvious reading of a delete button next to a generated
+    // test is that it deletes the test. It does not: the Java stays exactly where it is.
+    forget.title = 'Remove it from this list. The generated files in the repo are left alone.';
+    forget.addEventListener('click', guarded(async () => {
+        await api('/api/flow/library/' + summary.id, 'DELETE');
+        openLibraryBtn.click();
+    }));
+    row.appendChild(forget);
+
+    return row;
+}
+
+async function openSavedFlow(summary) {
+    const resp = await api('/api/flow/library/' + summary.id + '/open', 'POST');
+    libraryModal.classList.add('hidden');
+    enterRecordingUi(resp.flow.flowName);
+    if (resp.flow.targetArea) targetAreaSelect.value = resp.flow.targetArea;
+    assertionsToggle.checked = resp.flow.generateAssertions !== false;
+    renderSteps(resp.flow);
+    applyPreview(resp.preview);
+    if (resp.filesStillUntouched === false) {
+        showWarning('The generated files for this flow have changed on disk since it was written. '
+            + 'Generating again will leave a *GeneratedDraft.java beside them rather than '
+            + 'overwriting whatever is there now.');
+    }
+}
+
+function whenText(instant) {
+    if (!instant) return 'unknown date';
+    const then = new Date(instant);
+    const minutes = Math.round((Date.now() - then.getTime()) / 60000);
+    if (minutes < 1) return 'just now';
+    if (minutes < 60) return `${minutes} min ago`;
+    if (minutes < 60 * 24) return `${Math.round(minutes / 60)} h ago`;
+    return then.toLocaleDateString();
+}
+
+// --- Wrapping steps in try/catch -------------------------------------------
+//
+// The optional-screen problem: a coupon sheet, a permission prompt, a dialog that shows on
+// some runs and not others. Without this the honest options are to record two flows or to
+// let the whole test fail on a dialog nobody cares about. The repo already solves it by hand
+// — HandlingBottomSheets is nothing but try/catch around dismissals — so this generates the
+// shape that is already house style, and Replay honours it so the two agree.
+
+const tryModal = el('tryModal');
+const tryModalTitle = el('tryModalTitle');
+const tryFrom = el('tryFrom');
+const tryTo = el('tryTo');
+const tryOnFailure = el('tryOnFailure');
+const tryNote = el('tryNote');
+const tryCatchRange = el('tryCatchRange');
+const tryCatchFrom = el('tryCatchFrom');
+const tryCatchTo = el('tryCatchTo');
+const tryConfirmBtn = el('tryConfirmBtn');
+const tryCancelBtn = el('tryCancelBtn');
+
+/** The block a step belongs to, or null. */
+function blockFor(step) {
+    if (!step || !step.tryGroup) return null;
+    return (state.tryBlocks || []).find(b => b.id === step.tryGroup) || null;
+}
+
+function openTryModal(index) {
+    if (!state.recording) { showError('Start or resume a recording first'); return; }
+    const total = stepsList.children.length;
+    tryModalTitle.textContent = `Wrap step ${index + 1} in try/catch`;
+    tryFrom.value = String(index + 1);
+    tryTo.value = String(index + 1);
+    tryFrom.max = String(total);
+    tryTo.max = String(total);
+    tryNote.value = '';
+    tryOnFailure.value = 'CONTINUE';
+    tryCatchFrom.value = '';
+    tryCatchTo.value = '';
+    syncTryFields();
+    tryModal.classList.remove('hidden');
+    tryNote.focus();
+}
+
+tryCancelBtn.addEventListener('click', () => tryModal.classList.add('hidden'));
+tryOnFailure.addEventListener('change', syncTryFields);
+
+tryConfirmBtn.addEventListener('click', guarded(async () => {
+    const from = parseInt(tryFrom.value, 10) - 1;
+    const to = parseInt(tryTo.value, 10) - 1;
+    if (isNaN(from) || isNaN(to) || from < 0 || to < from || to >= stepsList.children.length) {
+        showError('Pick a range inside the flow, with "from" no later than "to"');
+        return;
+    }
+    const payload = { from, to, onFailure: tryOnFailure.value, note: tryNote.value.trim() || null };
+    if (tryOnFailure.value === 'RUN_RECOVERY_STEPS') {
+        const catchFrom = parseInt(tryCatchFrom.value, 10) - 1;
+        const catchTo = parseInt(tryCatchTo.value, 10) - 1;
+        if (isNaN(catchFrom) || isNaN(catchTo) || catchFrom < 0 || catchTo < catchFrom) {
+            showError('Pick the steps that should run instead when the try fails');
+            return;
+        }
+        payload.catchFrom = catchFrom;
+        payload.catchTo = catchTo;
+    }
+    const resp = await api('/api/flow/try-block', 'POST', payload);
+    tryModal.classList.add('hidden');
+    const current = await api('/api/flow/current');
+    renderSteps(current);
+    applyPreview(resp.preview);
+}));
+
+// --- Verify for real -------------------------------------------------------
+//
+// Step replay checks the step list. Once a flow carries a try/catch or a hand edit, the step
+// list is no longer the program that was written, and replay can never see a missing import,
+// a class that forgets to extend BaseSetup, or a locator PageFactory resolves differently
+// from findElements. This runs the actual TestNG class through Maven. It is slow and it takes
+// the phone away from the studio, which is why it is a deliberate button and not the default.
+
+const verifyBtn = el('verifyBtn');
+const verifyModal = el('verifyModal');
+const verifyClass = el('verifyClass');
+const verifyEnv = el('verifyEnv');
+const verifyRunBtn = el('verifyRunBtn');
+const verifyCancelBtn = el('verifyCancelBtn');
+const verifyBox = el('verifyBox');
+const verifySummary = el('verifySummary');
+const verifyOutput = el('verifyOutput');
+const verifyStop = el('verifyStop');
+const verifyCloseBtn = el('verifyCloseBtn');
+
+let verifyPoll = null;
+
+verifyBtn.addEventListener('click', () => {
+    if (!verifyClass.value) verifyClass.value = guessTestClass();
+    verifyModal.classList.remove('hidden');
+});
+verifyCancelBtn.addEventListener('click', () => verifyModal.classList.add('hidden'));
+verifyCloseBtn.addEventListener('click', () => verifyBox.classList.add('hidden'));
+verifyStop.addEventListener('click', guarded(() => api('/api/flow/verify/stop', 'POST')));
+
+/** The class this flow generates, so the common case needs no typing. */
+function guessTestClass() {
+    const name = (flowNameInput.value || '').trim();
+    if (!name) return '';
+    const area = (targetAreaSelect.value || 'GOLD').toLowerCase();
+    const className = name.charAt(0).toUpperCase() + name.slice(1) + 'Test';
+    return `com.jar.testCases.${area}TestCase.${className}`;
+}
+
+verifyRunBtn.addEventListener('click', guarded(async () => {
+    const testClass = verifyClass.value.trim();
+    if (!testClass) { showError('Which test class should run?'); return; }
+    const resp = await api('/api/flow/verify', 'POST', { testClass, env: verifyEnv.value });
+    verifyModal.classList.add('hidden');
+    verifyBox.classList.remove('hidden');
+    verifySummary.className = 'replay-summary running';
+    verifySummary.textContent = 'Starting Maven…';
+    verifyOutput.textContent = '';
+    if (resp.releasedDeviceSession) {
+        // Said plainly rather than left for the user to discover when the mirror goes dark.
+        setConnected(false);
+        showWarning('The device session was handed to the test run. Reconnect when it finishes.');
+    }
+    startVerifyPolling();
+}));
+
+function startVerifyPolling() {
+    stopVerifyPolling();
+    verifyPoll = setInterval(async () => {
+        try {
+            renderVerifyStatus(await api('/api/flow/verify/status'));
+        } catch (e) {
+            stopVerifyPolling();
+        }
+    }, 2000);
+}
+
+function stopVerifyPolling() {
+    if (verifyPoll) { clearInterval(verifyPoll); verifyPoll = null; }
+}
+
+function renderVerifyStatus(status) {
+    const running = status.state === 'RUNNING';
+    verifyStop.classList.toggle('hidden', !running);
+
+    const seconds = Math.round((status.elapsedMs || 0) / 1000);
+    const head = status.summary ? status.summary + ' · ' : '';
+    verifySummary.className = 'replay-summary '
+        + (running ? 'running' : (status.state === 'PASSED' ? 'ok' : 'bad'));
+    verifySummary.textContent = running
+        ? `${head}running ${status.testClass || ''} — ${seconds}s`
+        : `${head}${status.message || status.state} (${seconds}s)`;
+
+    verifyOutput.textContent = (status.output || []).join('\n');
+    verifyOutput.scrollTop = verifyOutput.scrollHeight;
+
+    if (!running) stopVerifyPolling();
+}
+
+// --- Dragging steps into a different order ---------------------------------
+//
+// Recording can only append, and the order you happen to explore a screen in is not always
+// the order the test should run in. Reordering is an edit like any other: nothing happens on
+// the device, and whether the flow still works in the new order is Replay's question.
+
+let dragFrom = null;
+
+function attachDragHandlers(li) {
+    li.addEventListener('dragstart', (ev) => {
+        dragFrom = [...stepsList.children].indexOf(li);
+        li.classList.add('dragging');
+        ev.dataTransfer.effectAllowed = 'move';
+        // Firefox will not start a drag without data on the transfer.
+        ev.dataTransfer.setData('text/plain', String(dragFrom));
+    });
+
+    li.addEventListener('dragend', () => {
+        li.draggable = false;
+        li.classList.remove('dragging');
+        clearDropMarkers();
+        dragFrom = null;
+    });
+
+    li.addEventListener('dragover', (ev) => {
+        if (dragFrom === null) return;
+        ev.preventDefault();
+        ev.dataTransfer.dropEffect = 'move';
+        clearDropMarkers();
+        li.classList.add(isAboveMiddle(ev, li) ? 'drop-above' : 'drop-below');
+    });
+
+    li.addEventListener('drop', guarded(async (ev) => {
+        ev.preventDefault();
+        if (dragFrom === null) return;
+        const over = [...stepsList.children].indexOf(li);
+        // Dropping on the top half means "before this row", on the bottom half "after it".
+        // Removing the dragged step first shifts everything below it up by one, which is why
+        // a downward move lands one short without this correction.
+        let to = isAboveMiddle(ev, li) ? over : over + 1;
+        if (dragFrom < to) to -= 1;
+        clearDropMarkers();
+        if (to === dragFrom) return;
+
+        const resp = await api(`/api/flow/step/${dragFrom}/move`, 'POST', { to });
+        dragFrom = null;
+        const current = await api('/api/flow/current');
+        renderSteps(current);
+        applyPreview(resp.preview);
+    }));
+}
+
+function isAboveMiddle(ev, li) {
+    const box = li.getBoundingClientRect();
+    return ev.clientY < box.top + box.height / 2;
+}
+
+function clearDropMarkers() {
+    [...stepsList.children].forEach(row => row.classList.remove('drop-above', 'drop-below'));
 }

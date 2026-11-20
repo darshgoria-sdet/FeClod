@@ -1,5 +1,6 @@
 package com.jar.flowcapture.capture;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -12,6 +13,7 @@ import java.util.List;
  * method's MethodParam list. Element arguments carry their own ranked locators so the
  * Locators class gets a field per target, exactly as a tapped element would.
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Data
 @AllArgsConstructor
 @NoArgsConstructor

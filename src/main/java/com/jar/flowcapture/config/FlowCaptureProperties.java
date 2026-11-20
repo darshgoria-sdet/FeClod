@@ -12,6 +12,26 @@ public class FlowCaptureProperties {
 
     private String targetRepoPath;
 
+    /**
+     * How to invoke Maven when running a generated test for real. Absolute by default
+     * because the studio is usually launched from a desktop app rather than a login shell,
+     * so "mvn" alone is often not on the PATH it inherits.
+     */
+    private String mavenPath = "mvn";
+
+    /**
+     * JAVA_HOME for a real test run, when the target repo needs a different JDK from the one
+     * the studio runs on. It does here: the studio is pinned to JDK 21 because Lombok's
+     * annotation processor does not support JDK 26, while Jar_Frontend_Automation compiles
+     * with --release 22. Maven inherits this process's environment, so without this the run
+     * fails at "Fatal error compiling ... target 22" before a single step executes.
+     *
+     * Left blank, JAVA_HOME is removed from the child's environment so Maven falls back to
+     * the system default — which is the right answer whenever the studio's own pin is the
+     * only thing in the way.
+     */
+    private String testJavaHome;
+
     @NestedConfigurationProperty
     private Appium appium = new Appium();
 

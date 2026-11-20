@@ -5,6 +5,7 @@ import com.jar.flowcapture.capture.ExistingLocatorRef;
 import com.jar.flowcapture.capture.UtilityArgs;
 import com.jar.flowcapture.capture.RecordedFlow;
 import com.jar.flowcapture.capture.RecordedStep;
+import com.jar.flowcapture.capture.TryBlock;
 import com.jar.flowcapture.catalog.MethodCatalogService;
 import com.jar.flowcapture.catalog.ReusableMethod;
 import org.junit.jupiter.api.Test;
@@ -350,5 +351,171 @@ class PageClassGeneratorTest {
         assertTrue(code.contains("HomeScreenLocators homeScreenLocators = new HomeScreenLocators(null);"));
         assertFalse(code.contains("instantSaveAbcLocators.getProfileIcon()"),
                 "the profile icon must come from the existing class, never from this flow's own");
+    }
+
+    /**
+     * An inserted wait has to land where it was inserted. Codegen walks the step list in
+     * order, so this is really a check that insertion and generation agree about position —
+     * the wait exists precisely because the tap after it was happening too early.
+     */
+    @Test
+    void anInsertedWaitIsGeneratedBetweenTheStepsItWasInsertedBetween() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test4");
+        flow.addStep(tap("offers card"));
+        flow.addStep(tap("first coupon"));
+
+        UtilityArgs args = new UtilityArgs();
+        args.getScalars().add(new UtilityArgs.ScalarArg("seconds", "3"));
+        flow.insertStep(1, utilityWithArgs(ReusableMethod.Kind.WAIT_FOR_SECONDS, args));
+
+        String code = generator.generate(flow, "Test4Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        List<String> calls = code.lines().map(String::trim)
+                .filter(l -> l.endsWith(";") && !l.startsWith("import") && !l.startsWith("private"))
+                .toList();
+        int waitLine = indexOfLineContaining(calls, "waitForSeconds(3)");
+        int firstTap = indexOfLineContaining(calls, "getOffersCard");
+        int secondTap = indexOfLineContaining(calls, "getFirstCoupon");
+
+        assertTrue(waitLine > firstTap && waitLine < secondTap,
+                "the wait should sit between the two taps, got: " + calls);
+        assertTrue(code.contains("import utilsPackage.WaitUtils;"), code);
+    }
+
+    private int indexOfLineContaining(List<String> lines, String needle) {
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).contains(needle)) return i;
+        }
+        return fail("no generated line contains " + needle + " in " + lines);
+    }
+
+    /**
+     * The optional-screen case this exists for: a coupon sheet that shows on some runs. The
+     * generated shape matches HandlingBottomSheets, which is how the repo already writes it
+     * by hand — @Slf4j on the class, log.info in the catch.
+     */
+    @Test
+    void wrappedStepsAreGeneratedInsideATryWithTheRepoSCatchIdiom() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test4");
+        flow.addStep(tap("offers card"));
+        flow.addStep(tap("dismiss coupon sheet"));
+        flow.addStep(tap("first coupon"));
+        TryBlock block = new TryBlock();
+        block.setNote("the coupon sheet is not shown on every run");
+        flow.wrapSteps(1, 1, block);
+
+        String code = generator.generate(flow, "Test4Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertTrue(code.contains("import lombok.extern.slf4j.Slf4j;"), code);
+        assertTrue(code.contains("@Slf4j\npublic class Test4Page"), code);
+        assertTrue(code.contains("""
+                        try {
+                            waitForClick(test4Locators.getDismissCouponSheet()).click();
+                        } catch (Exception e) {
+                            log.info("the coupon sheet is not shown on every run");
+                            log.info(e.getMessage());
+                        }
+                """.stripTrailing()), code);
+        // the steps outside the block stay where they were, at the original indent
+        assertTrue(code.contains("        waitForClick(test4Locators.getOffersCard()).click();\n        try {"), code);
+    }
+
+    @Test
+    void severalStepsShareOneTryBlock() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test4");
+        flow.addStep(tap("open sheet"));
+        flow.addStep(tap("confirm"));
+        flow.wrapSteps(0, 1, new TryBlock());
+
+        String code = generator.generate(flow, "Test4Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertEquals(1, code.split("try \\{", -1).length - 1, "one try for both steps:\n" + code);
+        assertEquals(1, code.split("catch \\(Exception e\\)", -1).length - 1, code);
+    }
+
+    /** FAIL_WITH_MESSAGE still fails — it just fails in the flow author's words. */
+    @Test
+    void aFailWithMessageBlockThrowsInsteadOfLogging() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test4");
+        flow.addStep(tap("pay"));
+        TryBlock block = new TryBlock();
+        block.setOnFailure(TryBlock.OnFailure.FAIL_WITH_MESSAGE);
+        block.setNote("payment screen never opened");
+        flow.wrapSteps(0, 0, block);
+
+        String code = generator.generate(flow, "Test4Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertTrue(code.contains("throw new AssertionError(\"payment screen never opened\", e);"), code);
+        assertFalse(code.contains("log.info"), "nothing logs, so the class needs no @Slf4j: " + code);
+        assertFalse(code.contains("@Slf4j"), code);
+    }
+
+    /** A flow with no blocks must generate exactly what it did before any of this existed. */
+    @Test
+    void aFlowWithNoTryBlocksIsUnchanged() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test4");
+        flow.addStep(tap("offers card"));
+
+        String code = generator.generate(flow, "Test4Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertFalse(code.contains("try {"), code);
+        assertFalse(code.contains("@Slf4j"), code);
+        assertTrue(code.contains("        waitForClick(test4Locators.getOffersCard()).click();\n"), code);
+    }
+
+    /** The backup route, generated the way the team writes it by hand. */
+    @Test
+    void recoveryStepsAreGeneratedInsideTheCatch() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test5");
+        flow.addStep(tap("primary way"));
+        flow.addStep(tap("other way"));
+        flow.addStep(tap("carry on"));
+        TryBlock block = new TryBlock();
+        block.setOnFailure(TryBlock.OnFailure.RUN_RECOVERY_STEPS);
+        block.setNote("the sheet sometimes opens the other way round");
+        flow.wrapSteps(0, 0, block);
+        flow.assignToCatch(1, 1, block.getId());
+
+        String code = generator.generate(flow, "Test5Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertTrue(code.contains("""
+                        try {
+                            waitForClick(test5Locators.getPrimaryWay()).click();
+                        } catch (Exception e) {
+                            log.info("the sheet sometimes opens the other way round");
+                            log.info(e.getMessage());
+                            waitForClick(test5Locators.getOtherWay()).click();
+                        }
+                """.stripTrailing()), code);
+    }
+
+    /** A backup step appears once, in the catch — never also in the main sequence. */
+    @Test
+    void aRecoveryStepIsNotAlsoEmittedInline() {
+        RecordedFlow flow = new RecordedFlow();
+        flow.setFlowName("Test5");
+        flow.addStep(tap("primary way"));
+        flow.addStep(tap("other way"));
+        TryBlock block = new TryBlock();
+        block.setOnFailure(TryBlock.OnFailure.RUN_RECOVERY_STEPS);
+        flow.wrapSteps(0, 0, block);
+        flow.assignToCatch(1, 1, block.getId());
+
+        String code = generator.generate(flow, "Test5Locators", "locaters.goldLocators", "pageObjectModel.gold")
+                .fileContent();
+
+        assertEquals(1, code.split("getOtherWay", -1).length - 1, code);
     }
 }

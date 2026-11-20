@@ -46,6 +46,20 @@ public class FlowSessionService {
         return currentFlow != null;
     }
 
+    /**
+     * Makes an already-recorded flow the current one again — re-opening a finished recording
+     * so it can be edited and regenerated, rather than re-walked on the phone.
+     *
+     * It keeps the flow's own id, which is what lets a second finish recognise the files it
+     * wrote the first time and update them instead of leaving another *GeneratedDraft.java.
+     */
+    public synchronized RecordedFlow adoptFlow(RecordedFlow flow) {
+        if (flow == null) throw new IllegalArgumentException("No flow to open");
+        currentFlow = flow;
+        persistenceService.save(flow);
+        return currentFlow;
+    }
+
     public synchronized void endFlow() {
         currentFlow = null;
         persistenceService.clear();
