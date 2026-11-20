@@ -2,8 +2,14 @@ package com.jar.flowcapture.web;
 
 import com.jar.flowcapture.appium.AppiumSessionService;
 import com.jar.flowcapture.config.FlowCaptureProperties;
+import com.jar.flowcapture.mirror.ScreenMirrorService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -22,12 +28,44 @@ import java.util.concurrent.TimeUnit;
 public class ScreenStreamController {
 
     private final AppiumSessionService appiumSessionService;
+    private final ScreenMirrorService screenMirrorService;
     private final long pollIntervalMs;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
-    public ScreenStreamController(AppiumSessionService appiumSessionService, FlowCaptureProperties properties) {
+    public ScreenStreamController(AppiumSessionService appiumSessionService,
+                                  ScreenMirrorService screenMirrorService,
+                                  FlowCaptureProperties properties) {
         this.appiumSessionService = appiumSessionService;
+        this.screenMirrorService = screenMirrorService;
         this.pollIntervalMs = properties.getScreenStream().getPollIntervalMs();
+    }
+
+    /**
+     * Pipes the device's own MJPEG broadcast straight to the browser's <img>. The content
+     * type is copied verbatim from upstream because it carries the multipart boundary the
+     * browser parses frames on.
+     *
+     * Everything here is a byte copy: no decoding, no base64, and crucially no WebDriver
+     * command, so a dashboard sitting open costs element lookups nothing.
+     */
+    @GetMapping("/api/screen-mjpeg")
+    public void mjpeg(HttpServletResponse response) throws IOException {
+        try (var upstream = screenMirrorService.open()) {
+            response.setContentType(upstream.contentType());
+            response.setHeader("Cache-Control", "no-store");
+            InputStream in = upstream.body();
+            OutputStream out = response.getOutputStream();
+            byte[] buffer = new byte[16 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+                out.flush();
+            }
+        } catch (IOException e) {
+            // The browser navigating away or reloading closes this mid-copy every time;
+            // that is the normal end of a mirror stream, not a fault worth logging loudly.
+            log.debug("MJPEG stream ended: {}", e.getMessage());
+        }
     }
 
     @GetMapping(value = "/api/screen-stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)

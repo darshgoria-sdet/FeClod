@@ -9,6 +9,7 @@ import com.jar.flowcapture.capture.RecordedStep;
 import com.jar.flowcapture.catalog.MethodCatalogService;
 import com.jar.flowcapture.catalog.ReusableMethod;
 import com.jar.flowcapture.execute.UtilityExecutor;
+import com.jar.flowcapture.reuse.LocatorIndexService;
 import lombok.extern.slf4j.Slf4j;
 import org.openqa.selenium.By;
 import org.springframework.stereotype.Service;
@@ -45,12 +46,14 @@ public class FlowReplayService {
     private final AppiumSessionService appium;
     private final UtilityExecutor utilityExecutor;
     private final MethodCatalogService methodCatalog;
+    private final LocatorIndexService locatorIndex;
 
     public FlowReplayService(AppiumSessionService appium, UtilityExecutor utilityExecutor,
-                             MethodCatalogService methodCatalog) {
+                             MethodCatalogService methodCatalog, LocatorIndexService locatorIndex) {
         this.appium = appium;
         this.utilityExecutor = utilityExecutor;
         this.methodCatalog = methodCatalog;
+        this.locatorIndex = locatorIndex;
     }
 
     public ReplayReport replay(RecordedFlow flow, boolean restartApp) {
@@ -59,8 +62,10 @@ public class FlowReplayService {
         long started = System.currentTimeMillis();
 
         if (restartApp) {
-            // Closing and reopening puts the app in the same state a real test run starts
-            // from, instead of wherever exploring happened to leave it.
+            // Terminate and relaunch. This runs the app's startup path again, but it does NOT
+            // reliably land on the home screen: Android restores the task, so the app usually
+            // comes back on the screen it was on, scroll position included. Confirmed on a
+            // real device — do not describe this to QA as a clean start.
             appium.closeApp();
             appium.openApp();
         }
@@ -118,28 +123,28 @@ public class FlowReplayService {
                         "Screen marker — generates a comment, nothing to run", 0, null);
             }
             case TAP -> {
-                By by = locatorFor(step);
-                if (by == null) {
+                List<By> locators = locatorsFor(step);
+                if (locators.isEmpty()) {
                     return new StepResult(number, type, label, StepResult.Status.FAILED,
                             "No executable locator — the only candidate is index-based", 0, null);
                 }
-                boolean ok = appium.clickElement(by, STEP_TIMEOUT_SECONDS);
-                return ok
+                By hit = appium.clickFirstVisible(locators, STEP_TIMEOUT_SECONDS);
+                return hit != null
                         ? new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null)
                         : new StepResult(number, type, label, StepResult.Status.FAILED,
-                                "Element never became visible within " + STEP_TIMEOUT_SECONDS + "s: " + by, 0, null);
+                                notFoundMessage(locators), 0, null);
             }
             case INPUT -> {
-                By by = locatorFor(step);
-                if (by == null) {
+                List<By> locators = locatorsFor(step);
+                if (locators.isEmpty()) {
                     return new StepResult(number, type, label, StepResult.Status.FAILED,
                             "No executable locator — the only candidate is index-based", 0, null);
                 }
-                boolean ok = appium.sendKeysToElement(by, step.getInputValue(), STEP_TIMEOUT_SECONDS);
-                return ok
+                By hit = appium.sendKeysToFirstVisible(locators, step.getInputValue(), STEP_TIMEOUT_SECONDS);
+                return hit != null
                         ? new StepResult(number, type, label, StepResult.Status.PASSED, null, 0, null)
                         : new StepResult(number, type, label, StepResult.Status.FAILED,
-                                "Input field never became visible within " + STEP_TIMEOUT_SECONDS + "s: " + by, 0, null);
+                                notFoundMessage(locators), 0, null);
             }
             case SCROLL_DOWN -> {
                 appium.scrollDown();
@@ -170,17 +175,44 @@ public class FlowReplayService {
     }
 
     /**
-     * Uses the locator the generated code will use — the reused repo locator when QA chose
-     * one, otherwise this flow's own best candidate. Replaying a different locator than the
-     * one that gets written would make the whole check meaningless.
+     * Every locator the generated code could resolve this element through, best-first.
+     *
+     * For a reused repo locator that means all the alternatives on the declaring field, not
+     * the single one stored on the reference: a field declared with @AndroidFindAll is ORed
+     * by PageFactory at runtime, so replaying only the first alternative is stricter than the
+     * test it is meant to be checking, and fails on elements the test would find.
      */
-    private By locatorFor(RecordedStep step) {
+    private List<By> locatorsFor(RecordedStep step) {
+        List<By> locators = new ArrayList<>();
         ExistingLocatorRef reused = step.getReusedLocator();
         if (reused != null) {
-            By by = LocatorBy.toBy(new CandidateLocator(reused.getStrategy(), reused.getLocatorValue(), null));
-            if (by != null) return by;
+            locatorIndex.findDeclared(reused.getLocatorsClassName(), reused.getFieldName())
+                    .ifPresent(declared -> declared.candidates().stream()
+                            .map(LocatorBy::toBy).filter(java.util.Objects::nonNull).forEach(locators::add));
+            if (locators.isEmpty()) {
+                By single = LocatorBy.toBy(
+                        new CandidateLocator(reused.getStrategy(), reused.getLocatorValue(), null));
+                if (single != null) locators.add(single);
+            }
         }
-        return LocatorBy.firstExecutable(step.getCandidateLocators());
+        // The captured candidates come second: when QA reused a repo locator that is what the
+        // test will use, but these are still valid ways to find the same element.
+        if (step.getCandidateLocators() != null) {
+            step.getCandidateLocators().stream()
+                    .map(LocatorBy::toBy)
+                    .filter(java.util.Objects::nonNull)
+                    .filter(by -> !locators.contains(by))
+                    .forEach(locators::add);
+        }
+        return locators;
+    }
+
+    /** Names every locator that was tried, so a failure says what to go and look at. */
+    private String notFoundMessage(List<By> locators) {
+        String tried = locators.size() == 1
+                ? locators.get(0).toString()
+                : locators.size() + " locators, none matched: " + locators;
+        return "Not found within " + STEP_TIMEOUT_SECONDS + "s — tried " + tried;
     }
 
     /**

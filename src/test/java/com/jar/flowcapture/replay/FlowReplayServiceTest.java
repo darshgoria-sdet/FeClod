@@ -8,7 +8,14 @@ import com.jar.flowcapture.catalog.MethodCatalogService;
 import com.jar.flowcapture.catalog.ReusableMethod;
 import com.jar.flowcapture.config.FlowCaptureProperties;
 import com.jar.flowcapture.execute.UtilityExecutor;
+import com.jar.flowcapture.reuse.LocatorIndexService;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import com.jar.flowcapture.capture.ExistingLocatorRef;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.openqa.selenium.By;
 
 import java.util.ArrayList;
@@ -30,16 +37,21 @@ class FlowReplayServiceTest {
             super(new FlowCaptureProperties());
         }
 
+        java.util.List<By> lastLocatorSet = java.util.List.of();
+
         @Override
-        public synchronized boolean clickElement(By by, int timeoutSeconds) {
-            calls.add("click:" + by);
-            return failClicksContaining == null || !by.toString().contains(failClicksContaining);
+        public synchronized By clickFirstVisible(java.util.List<By> locators, int timeoutSeconds) {
+            lastLocatorSet = locators;
+            calls.add("click:" + locators.get(0));
+            return locators.stream()
+                    .filter(by -> failClicksContaining == null || !by.toString().contains(failClicksContaining))
+                    .findFirst().orElse(null);
         }
 
         @Override
-        public synchronized boolean sendKeysToElement(By by, String text, int timeoutSeconds) {
+        public synchronized By sendKeysToFirstVisible(java.util.List<By> locators, String text, int timeoutSeconds) {
             calls.add("type:" + text);
-            return true;
+            return locators.get(0);
         }
 
         @Override
@@ -65,7 +77,8 @@ class FlowReplayServiceTest {
 
     private final FakeDevice device = new FakeDevice();
     private final FlowReplayService service =
-            new FlowReplayService(device, new UtilityExecutor(device), new MethodCatalogService());
+            new FlowReplayService(device, new UtilityExecutor(device), new MethodCatalogService(),
+                    new LocatorIndexService(new FlowCaptureProperties()));
 
     private RecordedStep tap(String label, String resourceId) {
         RecordedStep step = new RecordedStep();
@@ -195,5 +208,64 @@ class FlowReplayServiceTest {
         ReplayReport report = service.replay(flowWith(home), false);
 
         assertEquals("navigateBackUntilElementFound(profileIcon)", report.getResults().get(0).getLabel());
+    }
+
+    /**
+     * The failure QA hit: a step reusing HomeScreenLocators.profileIcon timed out after 25s
+     * reporting one XPath, while the element was on screen under a DIFFERENT alternative of
+     * the same @AndroidFindAll field. (On the live build the profile icon's content-desc is
+     * "new profile Icon" when a badge is showing, so the two exact-match alternatives miss and
+     * only the contains() one hits.) PageFactory ORs all four at runtime, so replaying only
+     * the first was stricter than the test it was checking.
+     */
+    @Test
+    void aReusedRepoLocatorReplaysWithEveryAlternativeOnTheField(@TempDir Path repo) throws Exception {
+        Path dir = repo.resolve("src/main/Java/locaters/goldLocators");
+        Files.createDirectories(dir);
+        Files.writeString(dir.resolve("HomeScreenLocators.java"), """
+                package locaters.goldLocators;
+                public class HomeScreenLocators {
+                    @AndroidFindAll({
+                            @AndroidBy(xpath = "//android.view.View[@content-desc='ProfileIcon']"),
+                            @AndroidBy(xpath = "//android.view.View[@content-desc='profile Icon']"),
+                            @AndroidBy(xpath = "(//android.view.View[contains(@content-desc,'profile')])[1]"),
+                            @AndroidBy(xpath = "//android.widget.ImageView[@content-desc='ProfileIcon']")
+                    })
+                    private WebElement profileIcon;
+                }
+                """);
+        FlowCaptureProperties properties = new FlowCaptureProperties();
+        properties.setTargetRepoPath(repo.toString());
+        LocatorIndexService index = new LocatorIndexService(properties);
+        index.refresh();
+
+        FlowReplayService replayService = new FlowReplayService(
+                device, new UtilityExecutor(device), new MethodCatalogService(), index);
+
+        RecordedStep step = tap("ProfileElement", "com.jar:id/unused");
+        step.setReusedLocator(new ExistingLocatorRef(
+                "HomeScreenLocators", "locaters.goldLocators", "profileIcon",
+                "//android.view.View[@content-desc='ProfileIcon']",
+                CandidateLocator.Strategy.EXACT_TEXT_XPATH, false, List.of()));
+
+        replayService.replay(flowWith(step), false);
+
+        List<String> tried = device.lastLocatorSet.stream().map(Object::toString).toList();
+        assertEquals(5, tried.size(),
+                "all four declared alternatives plus the captured candidate, got: " + tried);
+        assertTrue(tried.stream().anyMatch(t -> t.contains("contains(@content-desc,'profile')")),
+                "the alternative that actually matches on the live build must be tried");
+    }
+
+    /** A failure should say what was tried, not name one locator as if it were the only one. */
+    @Test
+    void aFailureNamesEveryLocatorItTried() {
+        device.failClicksContaining = "com.jar";
+
+        ReplayReport report = service.replay(flowWith(tap("tap one", "com.jar:id/one")), false);
+
+        String message = report.getResults().get(0).getMessage();
+        assertTrue(message.contains("tried"), message);
+        assertTrue(message.contains("com.jar:id/one"), message);
     }
 }

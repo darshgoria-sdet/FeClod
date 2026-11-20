@@ -122,6 +122,17 @@ kbd {
 }
 .step-index { color: #6b7280; font-size: 11px; min-width: 16px; }
 
+/* Visible only on hover: a delete control on every row is permanent visual noise in a list
+   QA reads constantly, and this is the one control here that destroys work. */
+.step-remove {
+    flex-shrink: 0; padding: 0; width: 20px; height: 20px; line-height: 1;
+    background: none; border: none; color: #6b7280; font-size: 15px;
+    opacity: 0; transition: opacity 0.12s ease, color 0.12s ease;
+}
+.step-item:hover .step-remove { opacity: 1; }
+.step-remove:hover { background: none; color: #ef7a7a; }
+.step-remove:focus-visible { opacity: 1; outline: 1px solid #4a6d94; }
+
 /* ---- Grouped, searchable method catalogue ---- */
 .action-search { flex-shrink: 0; }
 .action-groups { display: flex; flex-direction: column; gap: 14px; }
@@ -166,14 +177,51 @@ kbd {
     flex: 1 1 46%; min-width: 320px; padding: 14px;
     border-left: 1px solid #262a35; display: flex; flex-direction: column; min-height: 0;
 }
-.preview-tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-shrink: 0; }
+.preview-tabs { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; flex-shrink: 0; }
 .preview-tab { font-size: 12px; padding: 4px 11px; }
 .preview-tab.active { background: #3a4050; border-color: #5a6278; }
+/* A textarea, not a <pre>: this is the last chance to change what gets written. */
 .preview-code {
     flex: 1; margin: 0; overflow: auto; background: #11131a;
     border: 1px solid #262a35; border-radius: 8px; padding: 12px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11.5px; line-height: 1.55;
+    color: #e6e6e6; resize: none; width: 100%;
+    white-space: pre; tab-size: 4;
+}
+.preview-code:focus { outline: none; border-color: #4a6d94; }
+
+.checkbox-row {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12.5px; color: #c7ccd6; cursor: pointer; user-select: none;
+}
+.checkbox-row input { accent-color: #4a6d94; width: 14px; height: 14px; cursor: pointer; }
+
+.output-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.output-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: #7d8595; flex-shrink: 0;
+}
+/* Shortened in JS, not by CSS: `direction: rtl` truncates from the left but also drags the
+   leading "/" to the end, so the path renders with a slash it does not have. */
+.output-path {
+    flex: 1; min-width: 0; font-size: 11.5px; color: #a8aebb;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.output-destinations {
+    margin: 10px 0 0; font-size: 11px; line-height: 1.6; color: #a8aebb;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+}
+#outputPathInput {
+    width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+}
+
+.preview-tools { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.edited-flag {
+    font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 2px 6px; border-radius: 4px; background: #3a3320; color: #e0cf9a;
 }
 
 /* ---- Modals ---- */

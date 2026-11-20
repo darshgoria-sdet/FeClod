@@ -57,6 +57,20 @@
                     <input id="flowNameInput" placeholder="Flow name, e.g. InstantSaveAbcButton" />
                     <select id="targetAreaSelect"></select>
                 </div>
+                <!-- Opt-out, not opt-in: a test with no assertion only proves the app did not
+                     crash. But an inferred assertion is a claim about intent, so it stays a
+                     choice. -->
+                <label class="checkbox-row" title="Generate assertions in the test class">
+                    <input type="checkbox" id="assertionsToggle" checked />
+                    <span>Add assertions</span>
+                </label>
+                <!-- The destination was launch-time config only, so a recording could land in
+                     the wrong checkout with nothing on screen to suggest it would. -->
+                <div class="output-row">
+                    <span class="output-label">Output</span>
+                    <span id="outputPathText" class="output-path" title="Where generated files are written"></span>
+                    <button id="changeOutputBtn" class="link-btn">Change</button>
+                </div>
                 <div class="flow-row">
                     <button id="startFlowBtn" class="primary">Start Recording</button>
                     <button id="replayBtn" disabled title="Run every recorded step back against the device">Replay</button>
@@ -117,8 +131,17 @@
                 <button class="preview-tab active" data-file="locators">Locators</button>
                 <button class="preview-tab" data-file="page">Page</button>
                 <button class="preview-tab" data-file="test">Test</button>
+                <span class="preview-tools">
+                    <span id="editedFlag" class="edited-flag hidden">edited</span>
+                    <button id="revertPreviewBtn" class="link-btn hidden">Revert to generated</button>
+                </span>
             </div>
-            <pre id="previewCode" class="preview-code">// Start recording to see generated code here.</pre>
+            <!-- Editable: generation gets the boilerplate right but cannot know a better field
+                 name, a locator QA knows is more stable, or the assertion that belongs here.
+                 Whatever is in this box is what gets written, and it still goes through the
+                 style check on the way. -->
+            <textarea id="previewCode" class="preview-code" spellcheck="false"
+                      placeholder="// Start recording to see generated code here."></textarea>
         </div>
     </div>
 </div>
@@ -134,6 +157,42 @@
         <div class="modal-buttons">
             <button id="paramConfirmBtn" class="primary">Run &amp; record</button>
             <button id="paramCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Picking the repo generated files go into. -->
+<div id="outputModal" class="modal hidden">
+    <div class="modal-content wide">
+        <p class="modal-title">Where should generated files go?</p>
+        <p class="modal-desc">
+            The repo root of your automation checkout. Files go into its
+            <code>src/main/Java/...</code> and <code>src/test/java/...</code> folders, under the
+            area picked above.
+        </p>
+        <input id="outputPathInput" placeholder="/Users/you/work/Jar_Frontend_Automation" />
+        <p id="outputDestinations" class="output-destinations"></p>
+        <div class="modal-buttons">
+            <button id="outputSaveBtn" class="primary">Use this repo</button>
+            <button id="outputCancelBtn">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Finish replays the whole flow before writing anything. The override is here because
+     some flows genuinely cannot replay unattended — payment steps need a human. -->
+<div id="finishModal" class="modal hidden">
+    <div class="modal-content">
+        <p class="modal-title">Generate this flow</p>
+        <p class="modal-desc">
+            Every step runs again on the device, and nothing is written unless they all pass.
+            The app is relaunched first, but Android usually restores the screen it was on — so
+            leave the phone where the flow starts. If you just ran a clean replay this is skipped.
+        </p>
+        <div class="modal-buttons">
+            <button id="finishWithReplayBtn" class="primary">Replay &amp; generate</button>
+            <button id="finishSkipReplayBtn">Generate without replaying</button>
+            <button id="finishCancelBtn">Cancel</button>
         </div>
     </div>
 </div>

@@ -12,6 +12,14 @@ const state = {
     pendingAction: null, // "tap" | "input"
     activePreviewTab: 'locators',
     lastPreview: null,
+    // Real device resolution, from the server. Never derived from the mirrored image: the
+    // MJPEG broadcaster downscales frames (600x1335 for a 1200x2670 screen), so using the
+    // image's own size would halve every tap coordinate.
+    deviceWidth: 0,
+    deviceHeight: 0,
+    // Hand edits per file, keyed by tab. A file with an entry here is no longer refreshed
+    // from the generator — otherwise the next recorded step would silently discard the edit.
+    edits: {},
 };
 
 const el = (id) => document.getElementById(id);
@@ -43,6 +51,8 @@ const labelConfirmBtn = el('labelConfirmBtn');
 const labelCancelBtn = el('labelCancelBtn');
 const previewCode = el('previewCode');
 const previewTabs = document.querySelectorAll('.preview-tab');
+const editedFlag = el('editedFlag');
+const revertPreviewBtn = el('revertPreviewBtn');
 const resumeBanner = el('resumeBanner');
 const resumeText = el('resumeText');
 const resumeBtn = el('resumeBtn');
@@ -76,6 +86,18 @@ const replayBox = el('replayBox');
 const replaySummary = el('replaySummary');
 const replayResults = el('replayResults');
 const replayCloseBtn = el('replayCloseBtn');
+const finishModal = el('finishModal');
+const finishWithReplayBtn = el('finishWithReplayBtn');
+const finishSkipReplayBtn = el('finishSkipReplayBtn');
+const finishCancelBtn = el('finishCancelBtn');
+const assertionsToggle = el('assertionsToggle');
+const outputPathText = el('outputPathText');
+const changeOutputBtn = el('changeOutputBtn');
+const outputModal = el('outputModal');
+const outputPathInput = el('outputPathInput');
+const outputDestinations = el('outputDestinations');
+const outputSaveBtn = el('outputSaveBtn');
+const outputCancelBtn = el('outputCancelBtn');
 
 async function api(path, method = 'GET', body) {
     const res = await fetch(path, {
@@ -155,10 +177,16 @@ function guarded(handler) {
     // previous tab connected). Sync to it rather than showing a misleading "not connected".
     try {
         const status = await api('/api/flow/device/status');
-        if (status.connected) setConnected(true);
+        if (status.connected) setConnected(true, status);
         showWarning(status.packageWarning);
     } catch (e) {
         // non-fatal — worst case the user clicks Connect, which is idempotent server-side
+    }
+
+    try {
+        await refreshOutputPath();
+    } catch (e) {
+        showError('Could not read the output path: ' + e.message);
     }
 
     try {
@@ -182,6 +210,7 @@ resumeBtn.addEventListener('click', guarded(async () => {
     const current = await api('/api/flow/current');
     resumeBanner.classList.add('hidden');
     enterRecordingUi(current.flowName);
+    assertionsToggle.checked = current.generateAssertions !== false;
     renderSteps(current.steps);
     await refreshPreview();
 }));
@@ -191,16 +220,38 @@ discardResumeBtn.addEventListener('click', guarded(async () => {
     resumeBanner.classList.add('hidden');
 }));
 
-function setConnected(connected) {
+function setConnected(connected, deviceInfo) {
     state.connected = connected;
     connectBtn.disabled = connected;
     disconnectBtn.disabled = !connected;
     connectionStatus.textContent = connected ? 'connected' : 'not connected';
     connectionStatus.classList.toggle('live', connected);
-    if (connected) startScreenStream(); else stopScreenStream();
+
+    if (deviceInfo && deviceInfo.screenWidth) {
+        state.deviceWidth = deviceInfo.screenWidth;
+        state.deviceHeight = deviceInfo.screenHeight;
+    }
+    if (connected) startScreenStream(deviceInfo); else stopScreenStream();
 }
 
-function startScreenStream() {
+/**
+ * Two mirrors, and the server says which is live.
+ *
+ * MJPEG is the device's own broadcaster, piped through as multipart/x-mixed-replace and
+ * rendered natively by the <img> — measured at ~10 fps. The screenshot-polling fallback
+ * manages ~0.26 fps and, because every frame is a WebDriver command, it also competes with
+ * element lookups for the driver.
+ */
+function startScreenStream(deviceInfo) {
+    stopScreenStream();
+    const mode = deviceInfo && deviceInfo.mirror;
+    if (mode === 'MJPEG') {
+        // Cache-buster: without it a reconnect reuses the dead stream from the previous session.
+        screenImg.src = '/api/screen-mjpeg?t=' + Date.now();
+        state.mirrorMode = 'MJPEG';
+        return;
+    }
+    state.mirrorMode = 'SCREENSHOT_POLLING';
     state.eventSource = new EventSource('/api/screen-stream');
     state.eventSource.addEventListener('frame', (ev) => {
         screenImg.src = 'data:image/png;base64,' + ev.data;
@@ -215,7 +266,8 @@ function stopScreenStream() {
         state.eventSource.close();
         state.eventSource = null;
     }
-    screenImg.src = '';
+    // Pointing src at nothing is what actually closes an in-flight MJPEG connection.
+    screenImg.removeAttribute('src');
 }
 
 connectBtn.addEventListener('click', guarded(async () => {
@@ -223,7 +275,7 @@ connectBtn.addEventListener('click', guarded(async () => {
     connectionStatus.textContent = 'connecting...';
     try {
         const result = await api('/api/flow/device/connect', 'POST');
-        setConnected(true);
+        setConnected(true, result);
         if (result.packageWarning) showWarning(result.packageWarning); else clearWarning();
     } catch (e) {
         connectionStatus.textContent = 'not connected';
@@ -239,6 +291,11 @@ disconnectBtn.addEventListener('click', guarded(async () => {
 
 function enterRecordingUi(flowName) {
     state.recording = true;
+    state.edits = {};
+    // The override button renames itself to "Generate anyway" after a blocked finish; a new
+    // flow has not been blocked by anything, so it goes back to describing what it does.
+    finishSkipReplayBtn.textContent = 'Generate without replaying';
+    replayBox.classList.add('hidden');
     flowNameInput.value = flowName;
     stepsList.innerHTML = '';
     resultBox.classList.add('hidden');
@@ -270,7 +327,9 @@ function exitRecordingUi() {
 startFlowBtn.addEventListener('click', guarded(async () => {
     const flowName = flowNameInput.value.trim();
     if (!flowName) { showError('Enter a flow name first'); return; }
-    await api('/api/flow/start', 'POST', { flowName, targetArea: targetAreaSelect.value });
+    await api('/api/flow/start', 'POST', {
+        flowName, targetArea: targetAreaSelect.value, generateAssertions: assertionsToggle.checked,
+    });
     enterRecordingUi(flowName);
     try {
         const status = await api('/api/flow/device/status');
@@ -282,10 +341,67 @@ startFlowBtn.addEventListener('click', guarded(async () => {
     await refreshPreview();
 }));
 
-finishFlowBtn.addEventListener('click', guarded(async () => {
-    const response = await api('/api/flow/finish', 'POST', { allowOverwrite: false });
-    exitRecordingUi();
+finishFlowBtn.addEventListener('click', () => {
+    if (!state.recording) return;
+    finishModal.classList.remove('hidden');
+});
 
+finishCancelBtn.addEventListener('click', () => finishModal.classList.add('hidden'));
+finishWithReplayBtn.addEventListener('click', guarded(() => runFinish(false)));
+finishSkipReplayBtn.addEventListener('click', guarded(() => runFinish(true)));
+
+/**
+ * Generating a test that has never run end to end is how a flaky test reaches the repo, so
+ * finish replays first and writes nothing on a failure. The flow stays open in that case —
+ * QA fixes the step and finishes again rather than losing the recording.
+ */
+async function runFinish(skipReplay) {
+    finishModal.classList.add('hidden');
+    showPane('stepsPane');
+
+    if (!skipReplay) {
+        replayBox.classList.remove('hidden');
+        replayResults.innerHTML = '';
+        replaySummary.textContent = 'Replaying before writing anything\u2026 watch the phone.';
+        replaySummary.className = 'replay-summary running';
+    }
+
+    setDeviceControlsEnabled(false);
+    let response;
+    try {
+        response = await api('/api/flow/finish', 'POST', {
+            allowOverwrite: false,
+            skipReplay,
+            locatorsFileContent: state.edits.locators,
+            pageFileContent: state.edits.page,
+            testFileContent: state.edits.test,
+        });
+    } finally {
+        setDeviceControlsEnabled(true);
+    }
+
+    if (response.replayReport) {
+        renderReplayReport(response.replayReport);
+    } else if (!skipReplay) {
+        replayBox.classList.add('hidden');
+    }
+
+    // Blocked by the gate: nothing written, recording still live, so leave the UI in
+    // recording mode and offer the override rather than making QA start over.
+    if (response.replayReport && !response.replayReport.success) {
+        showResult(response);
+        finishSkipReplayBtn.textContent = 'Generate anyway';
+        finishModal.classList.remove('hidden');
+        return;
+    }
+
+    state.edits = {};
+    exitRecordingUi();
+    showResult(response);
+}
+
+/** Renders whatever finish came back with — written paths, or why nothing was written. */
+function showResult(response) {
     resultBox.classList.remove('hidden');
     const lines = [response.message, ''];
     if (response.locatorsFilePath) lines.push('Locators: ' + response.locatorsFilePath);
@@ -307,7 +423,8 @@ finishFlowBtn.addEventListener('click', guarded(async () => {
         allFindings.forEach(f => lines.push(`  [${f.severity}] ${f.message}`));
     }
     resultText.textContent = lines.join('\n');
-}));
+}
+
 
 // --- Quick actions: existing utilsPackage methods, one click each ---
 // The backend is the single source of truth for which methods are offered (only ones it can
@@ -454,6 +571,72 @@ async function runQuickAction(method) {
     addStepToLog(resp.step, displayName(method));
     applyPreview(resp.preview);
 }
+
+/* ---------------------------------------------------------------------------
+ * Assertions and output path
+ * ------------------------------------------------------------------------- */
+
+// Live rather than finish-time, so the code preview shows the real output while recording —
+// deciding whether to keep an assertion is much easier when you can see the assertion.
+assertionsToggle.addEventListener('change', guarded(async () => {
+    if (!state.recording) return;
+    const resp = await api('/api/flow/assertions', 'POST', { enabled: assertionsToggle.checked });
+    applyPreview(resp.preview);
+}));
+
+async function refreshOutputPath() {
+    const info = await api('/api/flow/output?area=' + encodeURIComponent(targetAreaSelect.value || 'GOLD'));
+    setOutputPathText(info.repoPath);
+    if (info.warning) showWarning(info.warning);
+    return info;
+}
+
+changeOutputBtn.addEventListener('click', guarded(async () => {
+    const info = await refreshOutputPath();
+    outputPathInput.value = info.repoPath || '';
+    renderDestinations(info.destinations);
+    outputModal.classList.remove('hidden');
+}));
+
+outputCancelBtn.addEventListener('click', () => outputModal.classList.add('hidden'));
+
+outputSaveBtn.addEventListener('click', guarded(async () => {
+    const info = await api('/api/flow/output', 'POST', {
+        repoPath: outputPathInput.value,
+        area: targetAreaSelect.value,
+    });
+    outputModal.classList.add('hidden');
+    setOutputPathText(info.repoPath);
+    // Advisory only — a brand-new checkout legitimately has none of the folders yet.
+    if (info.warning) showWarning(info.warning); else clearWarning();
+    await refreshLocatorIndexStatus();
+}));
+
+/**
+ * Keeps the tail of the path, which is the part that identifies the checkout — two clones
+ * differ at the end, not the beginning. Full path stays in the tooltip.
+ */
+function setOutputPathText(path) {
+    const full = path || '(not set)';
+    outputPathText.textContent = full.length > 44 ? '\u2026' + full.slice(-43) : full;
+    outputPathText.title = full;
+}
+
+/** Shows the three exact destinations, so the choice is unambiguous before anything is written. */
+function renderDestinations(destinations) {
+    if (!destinations) { outputDestinations.textContent = ''; return; }
+    outputDestinations.textContent =
+        'Locators \u2192 ' + destinations.locators + '\n'
+        + 'Page \u2192 ' + destinations.page + '\n'
+        + 'Test \u2192 ' + destinations.test;
+}
+
+// Changing area changes the destination folders, so keep the preview honest.
+targetAreaSelect.addEventListener('change', guarded(async () => {
+    if (!outputModal.classList.contains('hidden')) {
+        renderDestinations((await refreshOutputPath()).destinations);
+    }
+}));
 
 /* ---------------------------------------------------------------------------
  * Replay
@@ -804,9 +987,13 @@ screenImg.addEventListener('click', guarded(async (ev) => {
     if (!state.connected || !state.recording) return;
 
     const rect = screenImg.getBoundingClientRect();
+    // Aspect ratio comes from the rendered frame (it is correct whatever the scale), but the
+    // coordinates themselves are scaled to the REAL device resolution reported by the server.
     const naturalW = screenImg.naturalWidth;
     const naturalH = screenImg.naturalHeight;
     if (!naturalW || !naturalH) return;
+    const deviceW = state.deviceWidth || naturalW;
+    const deviceH = state.deviceHeight || naturalH;
 
     const renderedAspect = rect.width / rect.height;
     const naturalAspect = naturalW / naturalH;
@@ -830,8 +1017,8 @@ screenImg.addEventListener('click', guarded(async (ev) => {
         return; // clicked in the letterbox padding, not on the actual screen
     }
 
-    const deviceX = Math.round((clickXInImage / drawnWidth) * naturalW);
-    const deviceY = Math.round((clickYInImage / drawnHeight) * naturalH);
+    const deviceX = Math.round((clickXInImage / drawnWidth) * deviceW);
+    const deviceY = Math.round((clickYInImage / drawnHeight) * deviceH);
 
     // When a parameterised action is waiting for an element, this tap only identifies that
     // element — it must NOT become a step of its own, and must not drive the device, or the
@@ -969,6 +1156,18 @@ function addStepToLog(step, text) {
     span.textContent = text;
     li.appendChild(span);
 
+    const remove = document.createElement('button');
+    remove.className = 'step-remove';
+    remove.textContent = '\u00d7';
+    remove.title = 'Remove this step';
+    // Captured at click time, not at render time: every row re-renders after a delete, so an
+    // index baked in now would be stale the moment any other row is removed.
+    remove.addEventListener('click', guarded(async () => {
+        const index = [...stepsList.children].indexOf(li);
+        await deleteStep(index, stepsList.children.length);
+    }));
+    li.appendChild(remove);
+
     stepsList.appendChild(li);
     updateStepCount();
 }
@@ -980,23 +1179,44 @@ function updateStepCount() {
     stepsEmpty.classList.toggle('hidden', n > 0);
 }
 
+function stepLabel(step) {
+    if (step.actionType === 'SCREEN_BOUNDARY') {
+        return `--- Screen: ${step.screenName || '(unnamed)'} ---`;
+    }
+    if (step.actionType === 'UTILITY_CALL') {
+        // actionLabel here is the catalogue's full humanDescription, far too long for the log
+        // line — resolve the method name from the loaded catalogue instead.
+        const method = allMethods.find(m => m.kind === step.utilityMethodKind);
+        return method ? displayName(method) : 'Utility call';
+    }
+    return `${step.actionType}: ${step.actionLabel || ''}`;
+}
+
+/**
+ * Removing a step in the middle can leave the ones after it depending on state that no
+ * longer gets produced, so this warns once and then points at Replay — which is the only
+ * thing that can actually tell you whether the flow still works. Removing the last step is
+ * just undo, so it needs no warning.
+ */
+async function deleteStep(index, total) {
+    if (index < total - 1) {
+        const ok = window.confirm(
+            `Remove step ${index + 1} of ${total}?\n\n`
+            + 'Later steps may depend on what this one did. Nothing is changed on the phone — '
+            + 'run Replay afterwards to check the flow still works.');
+        if (!ok) return;
+    }
+    const resp = await api('/api/flow/step/' + index, 'DELETE');
+    const current = await api('/api/flow/current');
+    renderSteps(current.steps);
+    applyPreview(resp.preview);
+}
+
 function renderSteps(steps) {
     stepsList.innerHTML = '';
     updateStepCount();
     steps.forEach(step => {
-        let label;
-        if (step.actionType === 'SCREEN_BOUNDARY') {
-            label = `--- Screen: ${step.screenName || '(unnamed)'} ---`;
-        } else if (step.actionType === 'UTILITY_CALL') {
-            // actionLabel here is the catalog's full humanDescription, far too long for the log line.
-            // actionLabel here is the catalogue's full humanDescription, far too long for the
-            // log line — resolve the method name from the loaded catalogue instead.
-            const method = allMethods.find(m => m.kind === step.utilityMethodKind);
-            label = method ? displayName(method) : 'Utility call';
-        } else {
-            label = `${step.actionType}: ${step.actionLabel || ''}`;
-        }
-        addStepToLog(step, label);
+        addStepToLog(step, stepLabel(step));
     });
 }
 
@@ -1017,15 +1237,36 @@ function applyPreview(preview) {
     renderActivePreviewTab();
 }
 
-function renderActivePreviewTab() {
-    if (!state.lastPreview) return;
-    const fileMap = {
+function generatedFor(tab) {
+    if (!state.lastPreview) return '';
+    return {
         locators: state.lastPreview.locatorsFileContent,
         page: state.lastPreview.pageFileContent,
         test: state.lastPreview.testFileContent,
-    };
-    previewCode.textContent = fileMap[state.activePreviewTab] || '';
+    }[tab] || '';
 }
+
+function renderActivePreviewTab() {
+    const tab = state.activePreviewTab;
+    const edited = Object.prototype.hasOwnProperty.call(state.edits, tab);
+    previewCode.value = edited ? state.edits[tab] : generatedFor(tab);
+    editedFlag.classList.toggle('hidden', !edited);
+    revertPreviewBtn.classList.toggle('hidden', !edited);
+}
+
+// Typing in the panel takes ownership of that file: it stops tracking the generator and is
+// what gets written on finish. Recording can continue — later steps still update the other
+// files, and the generated version is one click away.
+previewCode.addEventListener('input', () => {
+    state.edits[state.activePreviewTab] = previewCode.value;
+    editedFlag.classList.remove('hidden');
+    revertPreviewBtn.classList.remove('hidden');
+});
+
+revertPreviewBtn.addEventListener('click', () => {
+    delete state.edits[state.activePreviewTab];
+    renderActivePreviewTab();
+});
 
 async function refreshPreview() {
     try {

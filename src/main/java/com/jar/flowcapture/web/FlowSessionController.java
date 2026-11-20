@@ -6,11 +6,15 @@ import com.jar.flowcapture.catalog.MethodCatalogService;
 import com.jar.flowcapture.catalog.ReusableMethod;
 import com.jar.flowcapture.codegen.*;
 import com.jar.flowcapture.execute.UtilityExecutor;
+import com.jar.flowcapture.mirror.ScreenMirrorService;
 import com.jar.flowcapture.replay.FlowReplayService;
+import com.jar.flowcapture.replay.ReplayGate;
+import com.jar.flowcapture.settings.OutputPathService;
 import com.jar.flowcapture.replay.ReplayReport;
 import com.jar.flowcapture.reuse.LocatorIndexService;
 import com.jar.flowcapture.style.StyleConformanceChecker;
 import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.ArrayList;
@@ -22,6 +26,7 @@ import java.util.Map;
  * step at a time, previewing generated code live, and finishing a flow to trigger
  * codegen + verification + the style gate + file write.
  */
+@Slf4j
 @RestController
 @RequestMapping("/api/flow")
 public class FlowSessionController {
@@ -39,6 +44,9 @@ public class FlowSessionController {
     private final UtilityExecutor utilityExecutor;
     private final LocatorIndexService locatorIndexService;
     private final FlowReplayService flowReplayService;
+    private final ScreenMirrorService screenMirrorService;
+    private final ReplayGate replayGate;
+    private final OutputPathService outputPathService;
 
     public FlowSessionController(AppiumSessionService appiumSessionService,
                                   FlowSessionService flowSessionService,
@@ -52,7 +60,10 @@ public class FlowSessionController {
                                   FileWriterService fileWriterService,
                                   UtilityExecutor utilityExecutor,
                                   LocatorIndexService locatorIndexService,
-                                  FlowReplayService flowReplayService) {
+                                  FlowReplayService flowReplayService,
+                                  ScreenMirrorService screenMirrorService,
+                                  ReplayGate replayGate,
+                                  OutputPathService outputPathService) {
         this.appiumSessionService = appiumSessionService;
         this.flowSessionService = flowSessionService;
         this.clickResolverService = clickResolverService;
@@ -66,6 +77,9 @@ public class FlowSessionController {
         this.utilityExecutor = utilityExecutor;
         this.locatorIndexService = locatorIndexService;
         this.flowReplayService = flowReplayService;
+        this.screenMirrorService = screenMirrorService;
+        this.replayGate = replayGate;
+        this.outputPathService = outputPathService;
     }
 
     @PostMapping("/device/connect")
@@ -82,10 +96,28 @@ public class FlowSessionController {
      */
     private Map<String, Object> deviceState() {
         boolean connected = appiumSessionService.isActive();
-        String warning = connected ? appiumSessionService.foregroundPackageWarning() : null;
-        return warning == null
-                ? Map.of("connected", connected)
-                : Map.of("connected", connected, "packageWarning", warning);
+        Map<String, Object> state = new java.util.LinkedHashMap<>();
+        state.put("connected", connected);
+        if (!connected) return state;
+
+        String warning = appiumSessionService.foregroundPackageWarning();
+        if (warning != null) state.put("packageWarning", warning);
+
+        // Set up the fast mirror here rather than at boot: the adb forward it depends on is
+        // lost every time the cable is unplugged, and connect is the one path guaranteed to
+        // run afterwards.
+        state.put("mirror", screenMirrorService.prepare().name());
+
+        // The dashboard maps a click to device coordinates with this, not with the mirrored
+        // image's pixel size, which is downscaled on the MJPEG path.
+        try {
+            int[] size = appiumSessionService.screenSize();
+            state.put("screenWidth", size[0]);
+            state.put("screenHeight", size[1]);
+        } catch (RuntimeException e) {
+            log.warn("Could not read the device screen size: {}", e.getMessage());
+        }
+        return state;
     }
 
     /**
@@ -110,8 +142,12 @@ public class FlowSessionController {
         // the reuse index is rebuilt per flow rather than once at boot — a stale index would
         // offer to reuse a locator that no longer exists.
         locatorIndexService.refresh();
+        replayGate.clear();
         RecordedFlow flow = flowSessionService.startNewFlow(request.getFlowName());
         flow.setTargetArea(request.getTargetArea() != null ? request.getTargetArea() : TargetArea.GOLD);
+        if (request.getGenerateAssertions() != null) {
+            flow.setGenerateAssertions(request.getGenerateAssertions());
+        }
         flowSessionService.persistCurrentState();
         return flow;
     }
@@ -120,6 +156,8 @@ public class FlowSessionController {
     public static class StartFlowRequest {
         private String flowName;
         private TargetArea targetArea;
+        /** Boxed so "not sent" is distinguishable from "sent false" and can keep the default. */
+        private Boolean generateAssertions;
     }
 
     /** Resumes a session persisted by a previous (possibly crashed) run of this app, if one exists. */
@@ -133,6 +171,7 @@ public class FlowSessionController {
     @PostMapping("/discard")
     public Map<String, Object> discard() {
         flowSessionService.endFlow();
+        replayGate.clear();
         return Map.of("discarded", true);
     }
 
@@ -381,7 +420,11 @@ public class FlowSessionController {
             throw new IllegalArgumentException("Nothing to replay — record at least one step first");
         }
         boolean restart = request != null && request.isRestartApp();
-        return flowReplayService.replay(flow, restart);
+        ReplayReport report = flowReplayService.replay(flow, restart);
+        // A manual replay counts towards the finish gate: having just watched the flow run
+        // clean, being made to sit through it again before generating would be absurd.
+        replayGate.record(flow, report);
+        return report;
     }
 
     @Data
@@ -434,21 +477,41 @@ public class FlowSessionController {
                     CandidateLocator.Strategy.RESOURCE_ID, value, null));
             case "CONTENT_DESC" -> candidates.add(new CandidateLocator(
                     CandidateLocator.Strategy.CONTENT_DESC, value, null));
-            default -> {
-                // Exact text first, then a textContains fallback — a label that wraps across
-                // two lines will not match an exact single-line XPath, and that exact failure
-                // has already bitten this generator once.
-                candidates.add(new CandidateLocator(CandidateLocator.Strategy.EXACT_TEXT_XPATH,
-                        "//*[@text=\"" + value.replace("\"", "\\\"") + "\"]", null));
-                candidates.add(new CandidateLocator(CandidateLocator.Strategy.TEXT_CONTAINS_UIAUTOMATOR,
-                        "new UiSelector().textContains(\"" + value.replace("\"", "\\\"") + "\")", null));
-            }
+            default -> candidates.addAll(textCandidates(value));
         }
 
         RecordedFlow flow = flowSessionService.requireCurrentFlow();
         String generating = NameUtils.toClassName(flow.getFlowName()) + "Locators";
         return new ResolveElementResponse(candidates,
                 locatorIndexService.findExisting(candidates, generating).orElse(null));
+    }
+
+    /**
+     * Every plausible way a typed label identifies an element, best-first.
+     *
+     * QA types what they can SEE, which is not necessarily what the element exposes. On this
+     * app in particular the visible label is often a Compose content-desc rather than a text
+     * attribute, exact matches miss when the label wraps or carries a suffix ("Offers" inside
+     * "View all offers"), and the capitalisation on screen is a guess. Each of these is a
+     * separate reason a correct-looking description finds nothing, so all of them get a
+     * candidate — and the one that actually matches on the device is promoted to the front
+     * before codegen, so the generated locator is the proven one rather than the first guess.
+     */
+    private List<CandidateLocator> textCandidates(String value) {
+        String escaped = value.replace("\"", "\\\"");
+        List<CandidateLocator> candidates = new ArrayList<>();
+        candidates.add(new CandidateLocator(CandidateLocator.Strategy.EXACT_TEXT_XPATH,
+                "//*[@text=\"" + escaped + "\"]", null));
+        candidates.add(new CandidateLocator(CandidateLocator.Strategy.CONTENT_DESC, value, null));
+        candidates.add(new CandidateLocator(CandidateLocator.Strategy.TEXT_CONTAINS_UIAUTOMATOR,
+                "new UiSelector().textContains(\"" + escaped + "\")", null));
+        candidates.add(new CandidateLocator(CandidateLocator.Strategy.EXACT_TEXT_XPATH,
+                "//*[contains(@content-desc,\"" + escaped + "\")]", null));
+        // Last resort: same substring, ignoring case. Quoted so a label containing regex
+        // metacharacters ("Save ₹500+", "24K gold (live)") matches literally.
+        candidates.add(new CandidateLocator(CandidateLocator.Strategy.TEXT_CONTAINS_UIAUTOMATOR,
+                "new UiSelector().textMatches(\"(?i).*\\\\Q" + escaped + "\\\\E.*\")", null));
+        return candidates;
     }
 
     @Data
@@ -516,6 +579,72 @@ public class FlowSessionController {
         return new StepResponse(removed, null, buildPreview(flow));
     }
 
+    /**
+     * Removes one step from anywhere in the flow, not just the end.
+     *
+     * Deliberately does not touch the device: the app is wherever the recording left it, and
+     * silently trying to "undo" a tap would be guesswork. Deleting a step in the middle can
+     * leave the remaining ones depending on state that is no longer produced — Replay is what
+     * tells you whether it did, so the dashboard points there rather than refusing the delete.
+     */
+    @DeleteMapping("/step/{index}")
+    public StepResponse deleteStep(@PathVariable int index) {
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        RecordedStep removed = flow.removeStep(index);
+        flowSessionService.persistCurrentState();
+        return new StepResponse(removed, null, buildPreview(flow));
+    }
+
+    /**
+     * Toggles assertions mid-recording. It is a live setting rather than a finish-time one so
+     * the code preview shows the real output as QA records — deciding whether to keep
+     * assertions is much easier when you can see the assertion.
+     */
+    @PostMapping("/assertions")
+    public StepResponse setAssertions(@RequestBody AssertionsRequest request) {
+        RecordedFlow flow = flowSessionService.requireCurrentFlow();
+        flow.setGenerateAssertions(request.isEnabled());
+        flowSessionService.persistCurrentState();
+        return new StepResponse(null, null, buildPreview(flow));
+    }
+
+    @Data
+    public static class AssertionsRequest {
+        private boolean enabled;
+    }
+
+    /**
+     * Where generated files land. Exposed because QA works across more than one checkout, and
+     * the old launch-time-only setting meant a recording could go into the wrong clone with
+     * nothing on screen to suggest it would.
+     */
+    @GetMapping("/output")
+    public Map<String, Object> outputPath(@RequestParam(required = false) TargetArea area) {
+        Map<String, Object> state = new java.util.LinkedHashMap<>();
+        String path = outputPathService.currentPath();
+        state.put("repoPath", path);
+        String warning = outputPathService.warningFor(path);
+        if (warning != null) state.put("warning", warning);
+        state.put("destinations", outputPathService.destinationsFor(area == null ? TargetArea.GOLD : area));
+        return state;
+    }
+
+    @PostMapping("/output")
+    public Map<String, Object> setOutputPath(@RequestBody OutputPathRequest request) {
+        outputPathService.setPath(request.getRepoPath());
+        // The reuse index is built from the target repo, so a different repo means a different
+        // set of existing locators — leaving the old index loaded would offer reuse of
+        // locators that do not exist in the repo now being written to.
+        locatorIndexService.refresh();
+        return outputPath(request.getArea());
+    }
+
+    @Data
+    public static class OutputPathRequest {
+        private String repoPath;
+        private TargetArea area;
+    }
+
     /** QA accepts the "use existing method X?" suggestion shown after a tap/scroll step. */
     @PostMapping("/step/{index}/accept-reuse")
     public Map<String, Object> acceptReuseSuggestion(@PathVariable int index, @RequestBody AcceptReuseRequest request) {
@@ -581,35 +710,55 @@ public class FlowSessionController {
         RecordedFlow flow = flowSessionService.requireCurrentFlow();
         TargetArea area = flow.getTargetArea() != null ? flow.getTargetArea() : TargetArea.GOLD;
 
+        // The gate. Generating a test that has never run end to end is how a flaky test reaches
+        // the repo, so nothing is written until the whole sequence has passed on the device.
+        // The flow stays open on failure — QA fixes a step and finishes again, rather than
+        // losing the recording.
+        ReplayReport gateReport = runFinishGate(flow, request);
+        if (gateReport != null && !gateReport.isSuccess()) {
+            return FinishResponse.blockedByReplay(gateReport);
+        }
+
         List<String> verificationWarnings = verifyLocatorsIfPossible(flow);
 
         var locatorsResult = locatorsClassGenerator.generate(flow, area.getLocatorsPackage());
         var pageResult = pageClassGenerator.generate(flow, locatorsResult.className(), area.getLocatorsPackage(), area.getPagePackage());
         var testResult = testClassGenerator.generate(flow, pageResult.className(), area.getPagePackage(), area.getTestPackage());
 
+        // Hand edits replace the generated body but keep the generated class name, because the
+        // name decides the filename and the three files reference each other by it. Renaming a
+        // class in the editor would otherwise write it to a path that does not match.
+        String locatorsContent = contentOrEdited(locatorsResult.fileContent(), request.getLocatorsFileContent());
+        String pageContent = contentOrEdited(pageResult.fileContent(), request.getPageFileContent());
+        String testContent = contentOrEdited(testResult.fileContent(), request.getTestFileContent());
+
+        // The style gate runs on what will actually be written, edits included — an edited
+        // file that breaks repo convention must be caught just as a generated one would be.
         List<StyleConformanceChecker.Finding> locatorFindings =
-                styleConformanceChecker.checkLocatorsFile(locatorsResult.fileContent());
+                styleConformanceChecker.checkLocatorsFile(locatorsContent);
         List<StyleConformanceChecker.Finding> pageFindings =
-                styleConformanceChecker.checkPageFile(pageResult.fileContent());
+                styleConformanceChecker.checkPageFile(pageContent);
         List<StyleConformanceChecker.Finding> testFindings =
-                styleConformanceChecker.checkTestFile(testResult.fileContent());
+                styleConformanceChecker.checkTestFile(testContent);
 
         if (styleConformanceChecker.hasBlockingErrors(locatorFindings)
                 || styleConformanceChecker.hasBlockingErrors(pageFindings)
                 || styleConformanceChecker.hasBlockingErrors(testFindings)) {
             flowSessionService.endFlow();
+            replayGate.clear();
             return new FinishResponse(null, null, null, locatorFindings, pageFindings, testFindings, verificationWarnings,
-                    "Blocking style errors found — files NOT written. Fix generator output and retry.");
+                    "Blocking style errors found — files NOT written. Fix generator output and retry.", gateReport);
         }
 
         var locatorsWrite = fileWriterService.writeLocatorsClass(
-                area.getLocatorsRelativePath(), locatorsResult.className(), locatorsResult.fileContent(), request.isAllowOverwrite());
+                area.getLocatorsRelativePath(), locatorsResult.className(), locatorsContent, request.isAllowOverwrite());
         var pageWrite = fileWriterService.writePageClass(
-                area.getPageRelativePath(), pageResult.className(), pageResult.fileContent(), request.isAllowOverwrite());
+                area.getPageRelativePath(), pageResult.className(), pageContent, request.isAllowOverwrite());
         var testWrite = fileWriterService.writeTestClass(
-                area.getTestRelativePath(), testResult.className(), testResult.fileContent(), request.isAllowOverwrite());
+                area.getTestRelativePath(), testResult.className(), testContent, request.isAllowOverwrite());
 
         flowSessionService.endFlow();
+        replayGate.clear();
 
         String message = "Files written. Review the diff in Jar_Frontend_Automation before committing — nothing here runs git.";
         if (locatorsWrite.isCollisionAvoided() || pageWrite.isCollisionAvoided() || testWrite.isCollisionAvoided()) {
@@ -619,7 +768,43 @@ public class FlowSessionController {
         }
 
         return new FinishResponse(locatorsWrite.getPath().toString(), pageWrite.getPath().toString(), testWrite.getPath().toString(),
-                locatorFindings, pageFindings, testFindings, verificationWarnings, message);
+                locatorFindings, pageFindings, testFindings, verificationWarnings, message, gateReport);
+    }
+
+    /**
+     * Returns the replay that satisfied (or failed) the gate, or null when the gate did not run.
+     *
+     * Skipped in three cases, each for a real reason: QA explicitly overrode it, this exact
+     * sequence already replayed clean, or there is no device to replay against — in which case
+     * blocking would strand a recording that QA may well want written anyway. "Not run" and
+     * "ran and passed" are deliberately both allowed through; only an actual failure blocks.
+     */
+    private ReplayReport runFinishGate(RecordedFlow flow, FinishRequest request) {
+        if (request.isSkipReplay()) {
+            log.info("Replay gate skipped by request for '{}'", flow.getFlowName());
+            return null;
+        }
+        if (replayGate.hasPassed(flow)) {
+            log.info("Replay gate already satisfied for '{}' — not re-running", flow.getFlowName());
+            return null;
+        }
+        if (!appiumSessionService.isActive() || flow.getSteps().isEmpty()) {
+            return null;
+        }
+        // Relaunch first, so the replay starts from the app's own startup path rather than
+        // from whatever exploring left behind. Worth knowing: terminate+activate does NOT
+        // guarantee a clean home screen — Android restores the task, so the app usually comes
+        // back on the screen it was on, scroll position included. Verified on a real device.
+        // The gate therefore checks that the flow runs from where the phone IS, which is the
+        // honest thing to check; it is not a substitute for a fresh-install run in CI.
+        ReplayReport report = flowReplayService.replay(flow, true);
+        replayGate.record(flow, report);
+        return report;
+    }
+
+    /** Blank counts as absent: an accidentally cleared editor must not write an empty file. */
+    private String contentOrEdited(String generated, String edited) {
+        return (edited == null || edited.isBlank()) ? generated : edited;
     }
 
     private List<String> verifyLocatorsIfPossible(RecordedFlow flow) {
@@ -651,6 +836,28 @@ public class FlowSessionController {
     @Data
     public static class FinishRequest {
         private boolean allowOverwrite;
+
+        /**
+         * Generate without requiring a passing replay. The escape hatch exists because some
+         * flows genuinely cannot replay unattended — anything built around the PhonePe
+         * simulator or the Dev Tools payment screen has steps only a human can perform.
+         */
+        private boolean skipReplay;
+
+        /**
+         * Hand-edited file contents from the dashboard's code panel, used verbatim in place
+         * of the generated text. Null (the normal case) means "use what the generator
+         * produced".
+         *
+         * Generation gets the boilerplate right but cannot know everything — a better field
+         * name, an assertion, a locator the QA engineer knows is more stable than the one
+         * captured. Without this the only way to apply such a change is to let the tool write
+         * a file and then edit it in the IDE, which loses the style check and the
+         * overwrite protection that run here.
+         */
+        private String locatorsFileContent;
+        private String pageFileContent;
+        private String testFileContent;
     }
 
     @Data
@@ -663,6 +870,20 @@ public class FlowSessionController {
         private final List<StyleConformanceChecker.Finding> testFindings;
         private final List<String> verificationWarnings;
         private final String message;
+        /** The replay that ran as part of this finish, or null when the gate did not run. */
+        private final ReplayReport replayReport;
+
+        /**
+         * Nothing written and the flow left open on purpose: QA deletes or re-records the
+         * failing step and finishes again, instead of losing the whole recording to a gate.
+         */
+        static FinishResponse blockedByReplay(ReplayReport report) {
+            return new FinishResponse(null, null, null, List.of(), List.of(), List.of(), List.of(),
+                    "Replay failed — nothing was written. " + report.getSummary()
+                            + ". Fix the step and finish again, or generate anyway if this flow "
+                            + "needs a human to drive part of it.",
+                    report);
+        }
     }
 
     /** A thumbnail failure should never interrupt recording — null just means the step log shows no image for that step. */

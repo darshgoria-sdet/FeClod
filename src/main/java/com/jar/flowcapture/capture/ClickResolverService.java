@@ -50,7 +50,13 @@ public class ClickResolverService {
                 .min(java.util.Comparator.comparingLong(this::area))
                 .orElseThrow();
 
-        return new ResolvedElement(best, LocatorRanker.rankCandidates(best));
+        // Counted against the whole page source, not just the tapped subtree: a locator is
+        // only useful if it is unique on the SCREEN, and the most common failure (an
+        // ancestor-scoped XPath anchored on a screen-level container) is invisible from
+        // inside the element itself.
+        List<CandidateLocator> ranked = LocatorRanker.countAndFilter(
+                doc.getDocumentElement(), LocatorRanker.rankCandidates(best));
+        return new ResolvedElement(best, ranked);
     }
 
     private Document parse(String xml) {

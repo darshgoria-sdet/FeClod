@@ -78,6 +78,7 @@ public class AppiumSessionService {
                 driver.quit();
             } finally {
                 driver = null;
+                cachedScreenSize = null;
             }
         }
     }
@@ -107,6 +108,17 @@ public class AppiumSessionService {
     public synchronized String captureScreenshotBase64() {
         byte[] bytes = requireDriver().getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
         return Base64.getEncoder().encodeToString(bytes);
+    }
+
+    /**
+     * The real device resolution, which the dashboard needs to turn a click on the mirror
+     * into device coordinates. It must come from here rather than from the mirrored image's
+     * own pixel size: the MJPEG broadcaster sends downscaled frames (600x1335 for a
+     * 1200x2670 screen), so trusting the image would halve every tap coordinate.
+     */
+    public synchronized int[] screenSize() {
+        var size = requireDriver().manage().window().getSize();
+        return new int[]{size.getWidth(), size.getHeight()};
     }
 
     public synchronized String capturePageSource() {
@@ -236,13 +248,55 @@ public class AppiumSessionService {
     /** Mirrors ActionUtils.MAX_ATTEMPTS. */
     public static final int MAX_ATTEMPTS = 6;
 
+    /**
+     * Present in the hierarchy AND actually on the screen.
+     *
+     * isDisplayed() alone is not enough on Android: a RecyclerView or Compose LazyColumn keeps
+     * rows attached after they scroll out of view, and they report displayed with bounds that
+     * sit outside the viewport. Trusting it produces two bad outcomes that both look like
+     * success — scrollUntilElementFound stops scrolling before the element is on screen, and a
+     * replayed tap is dispatched at off-screen coordinates, does nothing, and reports PASSED.
+     *
+     * Observed exactly that: a replay of a tap on a tile that was below the fold reported the
+     * step passed while the app sat on an unrelated screen. The viewport check is what makes
+     * "visible" mean what the rest of this class assumes it means.
+     */
     public synchronized boolean isElementVisible(By by) {
         try {
             var found = requireDriver().findElements(by);
-            return !found.isEmpty() && found.get(0).isDisplayed();
+            if (found.isEmpty()) return false;
+            WebElement element = found.get(0);
+            return element.isDisplayed() && isOnScreen(element);
         } catch (WebDriverException e) {
             return false;
         }
+    }
+
+    /** Judged by the element's centre, because that is the point a tap is dispatched to. */
+    private boolean isOnScreen(WebElement element) {
+        Dimension size = element.getSize();
+        if (size.getWidth() <= 0 || size.getHeight() <= 0) return false;
+
+        Point location = element.getLocation();
+        int centreX = location.getX() + size.getWidth() / 2;
+        int centreY = location.getY() + size.getHeight() / 2;
+        Dimension screen = screenSizeCached();
+        return centreX >= 0 && centreY >= 0
+                && centreX < screen.getWidth() && centreY < screen.getHeight();
+    }
+
+    /**
+     * Cached per session: this is consulted on every visibility check inside every scroll and
+     * wait loop, and a WebDriver round-trip per check would be a meaningful cost for a value
+     * that cannot change while the session lives.
+     */
+    private Dimension cachedScreenSize;
+
+    private Dimension screenSizeCached() {
+        if (cachedScreenSize == null) {
+            cachedScreenSize = requireDriver().manage().window().getSize();
+        }
+        return cachedScreenSize;
     }
 
     /**
@@ -265,6 +319,48 @@ public class AppiumSessionService {
             prevSource = currentSource;
         }
         return isElementVisible(by);
+    }
+
+    /**
+     * scrollUntilElementFound over several alternative locators for the same element.
+     *
+     * Needed because a described off-screen target is a guess at how the element identifies
+     * itself: QA types "Offers", and the label might be exposed as text, as a content-desc, or
+     * as part of a longer string. The alternatives exist precisely to cover that, so searching
+     * only the first one throws away the fallbacks that were built for this case.
+     */
+    public synchronized By scrollUntilAnyFound(List<By> locators) {
+        String prevSource = null;
+        for (int i = 0; i < MAX_ATTEMPTS; i++) {
+            By hit = firstVisible(locators);
+            if (hit != null) return hit;
+            scrollDown();
+            sleep(2000);
+            String currentSource = capturePageSource();
+            if (currentSource.equals(prevSource)) {
+                log.info("Page source unchanged after scroll — end of page reached");
+                return null;
+            }
+            prevSource = currentSource;
+        }
+        return firstVisible(locators);
+    }
+
+    public synchronized By scrollUpUntilAnyFound(List<By> locators) {
+        for (int i = 0; i < MAX_ATTEMPTS; i++) {
+            By hit = firstVisible(locators);
+            if (hit != null) return hit;
+            scrollUp();
+        }
+        return firstVisible(locators);
+    }
+
+    /** One pass over the alternatives, no waiting. */
+    public synchronized By firstVisible(List<By> locators) {
+        for (By by : locators) {
+            if (isElementVisible(by)) return by;
+        }
+        return null;
     }
 
     /** Mirrors ActionUtils.scrollUpUntilElementFound, which has no end-of-page short-circuit. */
@@ -291,20 +387,39 @@ public class AppiumSessionService {
      * alternatives are OR-ed by PageFactory at runtime. Checking only the first XPath here
      * would make the tool give up on a screen where the real generated test would succeed.
      */
-    public synchronized boolean navigateBackUntilAnyFound(List<By> locators) {
+    public synchronized By navigateBackUntilAnyFound(List<By> locators) {
         for (int i = 0; i < MAX_ATTEMPTS; i++) {
-            if (anyVisible(locators)) return true;
+            By hit = firstVisible(locators);
+            if (hit != null) return hit;
             pressBack();
             sleep(2000);
         }
-        return anyVisible(locators);
+        return firstVisible(locators);
     }
 
     public synchronized boolean anyVisible(List<By> locators) {
-        for (By by : locators) {
-            if (isElementVisible(by)) return true;
-        }
-        return false;
+        return firstVisible(locators) != null;
+    }
+
+    /**
+     * Polls until one of the locators resolves, and returns which one did.
+     *
+     * Taking a list rather than a single By is the whole point. A repo field declared with
+     * @AndroidFindAll holds several alternatives that PageFactory ORs at runtime, and a
+     * captured element has several ranked candidates. Checking only the best one makes the
+     * tool declare an element missing that the generated test would have found — observed in
+     * practice on the home-screen profile icon, whose content-desc is 'ProfileIcon' on some
+     * screens and 'profile Icon' on others.
+     */
+    public synchronized By findFirstVisible(List<By> locators, int timeoutSeconds) {
+        long deadline = System.currentTimeMillis() + timeoutSeconds * 1000L;
+        do {
+            for (By by : locators) {
+                if (isElementVisible(by)) return by;
+            }
+            sleep(300);
+        } while (System.currentTimeMillis() < deadline);
+        return null;
     }
 
     /**
@@ -312,19 +427,29 @@ public class AppiumSessionService {
      * element, then issue a real click rather than a coordinate tap, so replay exercises the
      * same path the test will.
      */
-    public synchronized boolean clickElement(By by, int timeoutSeconds) {
-        if (!waitForVisible(by, timeoutSeconds)) return false;
-        requireElement(by).click();
-        return true;
+    public synchronized By clickFirstVisible(List<By> locators, int timeoutSeconds) {
+        By found = findFirstVisible(locators, timeoutSeconds);
+        if (found == null) return null;
+        requireElement(found).click();
+        return found;
     }
 
     /** Replay equivalent of `waitForClick(x.getY()).sendKeys("...")`. */
-    public synchronized boolean sendKeysToElement(By by, String text, int timeoutSeconds) {
-        if (!waitForVisible(by, timeoutSeconds)) return false;
-        WebElement element = requireElement(by);
+    public synchronized By sendKeysToFirstVisible(List<By> locators, String text, int timeoutSeconds) {
+        By found = findFirstVisible(locators, timeoutSeconds);
+        if (found == null) return null;
+        WebElement element = requireElement(found);
         element.click();
         element.sendKeys(text == null ? "" : text);
-        return true;
+        return found;
+    }
+
+    public synchronized boolean clickElement(By by, int timeoutSeconds) {
+        return clickFirstVisible(List.of(by), timeoutSeconds) != null;
+    }
+
+    public synchronized boolean sendKeysToElement(By by, String text, int timeoutSeconds) {
+        return sendKeysToFirstVisible(List.of(by), text, timeoutSeconds) != null;
     }
 
     /** Mirrors ActionUtils.scrollTillEndOfSection — a section-scoped swipe that leaves page scroll alone. */

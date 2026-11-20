@@ -1,6 +1,7 @@
 package com.jar.flowcapture.execute;
 
 import com.jar.flowcapture.appium.AppiumSessionService;
+import com.jar.flowcapture.capture.CandidateLocator;
 import com.jar.flowcapture.capture.LocatorBy;
 import com.jar.flowcapture.capture.UtilityArgs;
 import com.jar.flowcapture.catalog.ReusableMethod;
@@ -48,33 +49,33 @@ public class UtilityExecutor {
             case SCROLL_DOWN -> appium.scrollDown();
             case SCROLL_UP -> appium.scrollUp();
 
-            // --- off-screen target: run the real search loop ---
-            case SCROLL_DOWN_UNTIL_VISIBLE -> requireFound(
-                    appium.scrollUntilElementFound(by(args, "element")),
-                    "Element not found after " + AppiumSessionService.MAX_ATTEMPTS + " downward scrolls");
-            case SCROLL_UP_UNTIL_VISIBLE -> requireFound(
-                    appium.scrollUpUntilElementFound(by(args, "element")),
-                    "Element not found after " + AppiumSessionService.MAX_ATTEMPTS + " upward scrolls");
+            // --- off-screen target: run the real search loop over EVERY alternative ---
+            case SCROLL_DOWN_UNTIL_VISIBLE -> searchAndPromote(args, "element",
+                    appium::scrollUntilAnyFound,
+                    "Not found after " + AppiumSessionService.MAX_ATTEMPTS + " downward scrolls");
+            case SCROLL_UP_UNTIL_VISIBLE -> searchAndPromote(args, "element",
+                    appium::scrollUpUntilAnyFound,
+                    "Not found after " + AppiumSessionService.MAX_ATTEMPTS + " upward scrolls");
             // Pinned to HomeScreenLocators.profileIcon, which the repo declares as four
             // alternative XPaths — all of them are tried, matching @AndroidFindAll's own
             // OR semantics, rather than only the highest-ranked one.
-            case RETURN_TO_HOME -> requireFound(
-                    appium.navigateBackUntilAnyFound(everyLocatorFor(args, "element")),
+            case RETURN_TO_HOME -> searchAndPromote(args, "element",
+                    appium::navigateBackUntilAnyFound,
                     "Still not on the home screen after " + AppiumSessionService.MAX_ATTEMPTS
                             + " back presses — the profile icon never appeared. The app may be on a screen "
                             + "that swallows back, or a dialog may be open.");
-            case NAVIGATE_BACK_UNTIL_VISIBLE -> requireFound(
-                    appium.navigateBackUntilElementFound(by(args, "element")),
-                    "Element not found after " + AppiumSessionService.MAX_ATTEMPTS + " back navigations");
+            case NAVIGATE_BACK_UNTIL_VISIBLE -> searchAndPromote(args, "element",
+                    appium::navigateBackUntilAnyFound,
+                    "Not found after " + AppiumSessionService.MAX_ATTEMPTS + " back navigations");
 
             // --- on-screen target ---
             case SCROLL_TILL_END_OF_SECTION -> appium.scrollTillEndOfSection(by(args, "sectionElement"));
             case HOLD_AND_DRAG -> appium.holdAndDrag(by(args, "element"));
             case DRAG_LEFT_TO_RIGHT -> appium.dragLeftToRight(by(args, "element"));
             case TAP_ELEMENT -> appium.tapElementAt(by(args, "element"));
-            case WAIT_FOR_VISIBILITY, WAIT_FOR_PRESENCE -> requireFound(
-                    appium.waitForVisible(by(args, "element"), 20),
-                    "Element did not become visible within 20s");
+            case WAIT_FOR_VISIBILITY, WAIT_FOR_PRESENCE -> searchAndPromote(args, "element",
+                    locators -> appium.findFirstVisible(locators, 20),
+                    "Did not become visible within 20s");
 
             // --- several elements ---
             case WAIT_FOR_ANY_VISIBLE -> requireFound(
@@ -115,6 +116,69 @@ public class UtilityExecutor {
 
     private void requireFound(boolean found, String message) {
         if (!found) throw new IllegalArgumentException(message);
+    }
+
+    /** A search that takes every alternative locator and reports which one matched. */
+    private interface Search {
+        By run(List<By> locators);
+    }
+
+    /**
+     * Runs a search over every locator for an element argument and, on success, moves the one
+     * that matched to the front of that argument's candidate list.
+     *
+     * Searching all the alternatives is what makes the action work: a described off-screen
+     * target is a guess at how the element identifies itself — QA types "Offers" and the label
+     * may be exposed as text, as a content-desc, or inside a longer string — and the fallback
+     * candidates exist precisely for that. Trying only the first one discarded them.
+     *
+     * The promotion is the half that is easy to miss. Codegen writes the FIRST candidate into
+     * the Locators class, so without reordering, QA would watch the scroll succeed and still
+     * be handed a locator that does not resolve. The locator written is now the one proven.
+     */
+    private void searchAndPromote(UtilityArgs args, String paramName, Search search, String failureMessage) {
+        var targets = args == null ? List.<UtilityArgs.ElementTarget>of() : args.elementsFor(paramName);
+        if (targets.isEmpty()) {
+            throw new IllegalArgumentException("Missing required element argument: " + paramName);
+        }
+        UtilityArgs.ElementTarget target = targets.get(0);
+        List<CandidateLocator> candidates = executableCandidates(target);
+        List<By> locators = candidates.stream().map(LocatorBy::toBy).toList();
+
+        By hit = search.run(locators);
+        if (hit == null) {
+            throw new IllegalArgumentException(failureMessage + " — tried "
+                    + locators.size() + " locator(s): " + locators);
+        }
+        promote(target, candidates.get(locators.indexOf(hit)));
+    }
+
+    private List<CandidateLocator> executableCandidates(UtilityArgs.ElementTarget target) {
+        List<CandidateLocator> candidates = (target.getCandidateLocators() == null
+                ? List.<CandidateLocator>of() : target.getCandidateLocators()).stream()
+                .filter(c -> LocatorBy.toBy(c) != null)
+                .toList();
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No usable locator for this element — the only candidate is index-based, which "
+                            + "cannot be resolved automatically");
+        }
+        return candidates;
+    }
+
+    /**
+     * Reorders in place so the proven locator is first. A locator reused from an existing repo
+     * class is left alone: the generated call goes through that class's own field, so the
+     * candidate order behind it changes nothing.
+     */
+    private void promote(UtilityArgs.ElementTarget target, CandidateLocator winner) {
+        if (target.getReusedFrom() != null) return;
+        List<CandidateLocator> reordered = new java.util.ArrayList<>();
+        reordered.add(winner);
+        for (CandidateLocator c : target.getCandidateLocators()) {
+            if (c != winner) reordered.add(c);
+        }
+        target.setCandidateLocators(reordered);
     }
 
     private By by(UtilityArgs args, String paramName) {
